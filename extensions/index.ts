@@ -333,6 +333,36 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 .btn-yes{background:var(--er);color:#fff}
 .btn-yes:hover{opacity:.85}
 .confirm-timer{padding:0 16px 8px;font-size:12px;color:var(--dm);text-align:center}
+
+/* ── ハンバーガーボタン ────────────────────── */
+#hamburger{width:36px;height:36px;border-radius:8px;border:none;background:transparent;cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;padding:0;flex-shrink:0;-webkit-tap-highlight-color:transparent}
+#hamburger span{display:block;width:20px;height:2px;background:var(--tx);border-radius:2px;transition:transform .3s ease,opacity .3s ease,top .3s ease}
+#hamburger:active{background:var(--bd)}
+#hamburger.open span:nth-child(1){transform:translateY(7px) rotate(45deg)}
+#hamburger.open span:nth-child(2){opacity:0;transform:scaleX(0)}
+#hamburger.open span:nth-child(3){transform:translateY(-7px) rotate(-45deg)}
+
+/* ── サイドバー backdrop ─────────────────── */
+.sb-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:50;backdrop-filter:blur(2px);-webkit-backdrop-filter:blur(2px);transition:opacity .3s}
+.sb-backdrop.open{display:block;animation:bdIn .25s ease forwards}
+@keyframes bdIn{from{opacity:0}to{opacity:1}}
+
+/* ── サイドバー本体 ──────────────────────── */
+.sidebar{position:fixed;top:0;left:0;bottom:0;width:min(280px,85vw);background:var(--sf);border-right:1px solid var(--bd);z-index:60;display:flex;flex-direction:column;transform:translateX(-100%);transition:transform .3s cubic-bezier(.4,0,.2,1);box-shadow:none;padding-top:env(safe-area-inset-top,0px)}
+.sidebar.open{transform:translateX(0);box-shadow:4px 0 32px rgba(0,0,0,.4)}
+.sb-header{padding:20px 16px 14px;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--dm);border-bottom:1px solid var(--bd);flex-shrink:0}
+.sb-list{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:8px 0}
+
+/* ── セッションアイテム ───────────────────── */
+.sb-item{display:flex;align-items:center;gap:12px;padding:12px 16px;cursor:pointer;border-radius:10px;margin:2px 8px;transition:background .15s;-webkit-tap-highlight-color:transparent}
+.sb-item:active{background:var(--bg)}
+.sb-item.active{background:rgba(124,58,237,.12)}
+.sb-item-icon{font-size:20px;flex-shrink:0;width:32px;text-align:center}
+.sb-item-body{flex:1;min-width:0}
+.sb-item-name{font-size:13px;font-weight:600;color:var(--tx);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:2px}
+.sb-item-sub{font-size:11px;color:var(--dm);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--fm)}
+.sb-cur-dot{width:8px;height:8px;border-radius:50%;background:var(--ok);flex-shrink:0;box-shadow:0 0 6px var(--ok)}
+.sb-item-badge{font-size:10px;font-weight:600;color:var(--ac);background:rgba(124,58,237,.15);padding:3px 8px;border-radius:20px;border:1px solid rgba(124,58,237,.3);flex-shrink:0;white-space:nowrap}
 </style>
 </head>
 <body>
