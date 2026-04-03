@@ -317,8 +317,6 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 .modal-item .mi-check{width:20px;flex-shrink:0;text-align:center}
 .modal-item .mi-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .modal-item .mi-prov{font-size:11px;color:var(--dm);flex-shrink:0}
-#sess{font-size:11px;color:var(--dm);cursor:pointer;padding:4px 8px;border-radius:8px;background:var(--bg);border:1px solid var(--bd);white-space:nowrap;flex-shrink:0}
-#sess:active{background:var(--bd)}
 /* ── 確認ダイアログ ───────────────────────── */
 .confirm-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:200;align-items:center;justify-content:center;padding:20px}
 .confirm-overlay.show{display:flex}
@@ -339,19 +337,21 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 </head>
 <body>
 
-<div class="hd">
-  <div id="dot" class="dot"></div>
-  <div class="ht">Pi Remote</div>
-  <div id="mdl" onclick="openModelPicker()">---</div>
-  <div id="sess" onclick="openSessionPicker()"></div>
-  <div id="hm" class="hm"></div>
-</div>
+<!-- サイドバー -->
+<div id="sbBackdrop" class="sb-backdrop" onclick="closeSidebar()"></div>
+<nav id="sidebar" class="sidebar">
+  <div class="sb-header">Sessions</div>
+  <div id="sbList" class="sb-list"></div>
+</nav>
 
-<div id="sessOverlay" class="overlay" onclick="closeSessionPicker()">
-  <div class="modal" onclick="event.stopPropagation()">
-    <div class="modal-title">セッション切替</div>
-    <div id="sessList" class="modal-list"></div>
-  </div>
+<div class="hd">
+  <button id="hamburger" onclick="toggleSidebar()" aria-label="メニュー">
+    <span></span><span></span><span></span>
+  </button>
+  <div id="dot" class="dot"></div>
+  <div class="ht" id="hdTitle">Pi Remote</div>
+  <div id="mdl" onclick="openModelPicker()">---</div>
+  <div id="hm" class="hm"></div>
 </div>
 
 <div id="modelOverlay" class="overlay" onclick="closeModelPicker()">
@@ -389,6 +389,56 @@ function api(path){return BASE+path;}
 const msgs=$("msgs"), inp=$("inp"), dot=$("dot"), hm=$("hm"), sndBtn=$("snd"), stpBtn=$("stp");
 let lastId=0, processing=false, streamEl=null, sentLocally=false;
 let currentConfirmId=null, confirmTimerEl=null;
+let currentSessionId='';
+
+// ── サイドバー ────────────────────────────
+function toggleSidebar(){
+  const sb=$('sidebar'), bd=$('sbBackdrop'), hb=$('hamburger');
+  const opening=!sb.classList.contains('open');
+  sb.classList.toggle('open',opening);
+  bd.classList.toggle('open',opening);
+  hb.classList.toggle('open',opening);
+  if(opening) loadSidebarSessions();
+}
+function closeSidebar(){
+  $('sidebar').classList.remove('open');
+  $('sbBackdrop').classList.remove('open');
+  $('hamburger').classList.remove('open');
+}
+async function loadSidebarSessions(){
+  try{
+    const r=await fetch(api('/sessions'));
+    const d=await r.json();
+    const sessions=d.sessions||[];
+    const cur=d.current||currentSessionId;
+    const list=$('sbList');
+    list.innerHTML='';
+    if(!sessions.length){
+      list.innerHTML='<div style="padding:20px;color:var(--dm);font-size:13px;text-align:center">セッションなし</div>';
+      return;
+    }
+    for(const s of sessions){
+      const isCur=s.sessionId===cur;
+      const dir=s.workingDir.split('/').slice(-2).join('/');
+      const item=document.createElement('div');
+      item.className='sb-item'+(isCur?' active':'');
+      item.innerHTML=
+        '<div class="sb-item-icon">'+(isCur?'🖥️':'💻')+'</div>'+
+        '<div class="sb-item-body">'+
+          '<div class="sb-item-name">'+dir+'</div>'+
+          '<div class="sb-item-sub">'+s.sessionId+' · :'+s.port+'</div>'+
+        '</div>'+
+        (isCur?'<div class="sb-cur-dot"></div>':'<div class="sb-item-badge">切替</div>');
+      item.onclick=()=>{
+        closeSidebar();
+        if(!isCur) window.location.href=s.directUrl||s.url;
+      };
+      list.appendChild(item);
+    }
+  }catch(e){
+    $('sbList').innerHTML='<div style="padding:20px;color:var(--er);font-size:13px;text-align:center">読み込み失敗</div>';
+  }
+}
 
 function addM(cls,text){
   const d=document.createElement("div");
@@ -602,42 +652,10 @@ async function interrupt(){
 sndBtn.onclick=send;
 stpBtn.onclick=interrupt;
 
-// ── セッション切替 ───────────────────────────────
-const sessBtn=$('sess'), sessOverlay=$('sessOverlay'), sessList=$('sessList');
-
 function updateSessionLabel(sid){
-  sessBtn.textContent='📁 '+sid;
+  currentSessionId=sid;
+  $('hdTitle').textContent='Pi · '+sid;
 }
-
-async function openSessionPicker(){
-  try{
-    const r=await fetch(api('/sessions'));
-    const d=await r.json();
-    const sessions=d.sessions||[];
-    const cur=d.current||'';
-    sessList.innerHTML='';
-    if(sessions.length<=1){
-      sessList.innerHTML='<div class="modal-item" style="color:var(--dm);justify-content:center">他のセッションなし</div>';
-    }
-    for(const s of sessions){
-      const item=document.createElement('div');
-      item.className='modal-item'+(s.sessionId===cur?' active':'');
-      const dir=s.workingDir.split('/').slice(-2).join('/');
-      item.innerHTML=
-        '<span class="mi-check">'+(s.sessionId===cur?'✓':'')+
-        '</span><span class="mi-name">'+dir+
-        '</span><span class="mi-prov">:'+s.port+'</span>';
-      item.onclick=()=>{
-        if(s.sessionId!==cur) window.location.href=s.directUrl||s.url;
-        closeSessionPicker();
-      };
-      sessList.appendChild(item);
-    }
-    sessOverlay.classList.add('show');
-  }catch(e){}
-}
-
-function closeSessionPicker(){ sessOverlay.classList.remove('show'); }
 
 // ── モデル選択 ─────────────────────────────────
 const mdlBtn=$('mdl'), modelOverlay=$('modelOverlay'), modelList=$('modelList');
