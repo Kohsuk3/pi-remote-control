@@ -2,7 +2,7 @@
 
 [日本語版 README はこちら](./README.ja.md)
 
-A [Pi](https://github.com/mariozechner/pi-coding-agent) extension that lets you control Pi from your smartphone via Tailscale.
+A [Pi](https://github.com/badlogic/pi-mono) extension that lets you control Pi from your smartphone via Tailscale.
 
 Securely connect over HTTPS and interact with Pi through a mobile-optimized Web UI — send prompts, view LLM responses in real-time, switch models, and manage multiple sessions.
 
