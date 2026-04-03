@@ -1,70 +1,111 @@
 # pi-remote-control
 
-スマートフォンからPiをリモートコントロールする拡張機能。
+[日本語版 README はこちら](./README.ja.md)
 
-Tailscale HTTPS経由でセキュアに接続し、モバイル最適化されたWeb UIからPiを操作できます。
+A [Pi](https://github.com/mariozechner/pi) extension that lets you control Pi from your smartphone via Tailscale.
 
-## 機能
+Securely connect over HTTPS and interact with Pi through a mobile-optimized Web UI — send prompts, view LLM responses in real-time, switch models, and manage multiple sessions.
 
-- 📱 **スマートフォンからプロンプト送信** — Web UIでPiと対話
-- ⚡ **LLM応答のリアルタイム表示** — ストリーミング対応
-- 🔄 **モデル切り替え** — Web UIからモデルを変更
-- 📁 **セッション切り替え** — 複数のPiセッション間を移動
-- 🔒 **HTTPS** — Tailscale証明書で暗号化
-- 🖥️ **ホスト側Piも同時操作可能** — 双方向のやり取りを共有
-- 🔢 **マルチセッション** — セッションごとにポート自動割り当て
-- 📜 **履歴表示** — 途中参加でも過去のやり取りを表示
+## Features
 
-## 前提条件
+- 📱 **Send prompts from your phone** — chat with Pi via Web UI
+- ⚡ **Real-time LLM streaming** — watch responses as they generate
+- 🔄 **Model switching** — change models directly from Web UI
+- 📁 **Session switching** — jump between multiple Pi sessions
+- 🔒 **HTTPS** — TLS termination via `tailscale serve`, no port numbers needed
+- 🖥️ **Dual input** — both host Pi and Web UI can send prompts, with shared history
+- 🔢 **Multi-session** — automatic port assignment per session
+- 📜 **Session history** — see past conversation when connecting mid-session
+- 🇯🇵 **iOS Japanese IME** — full flick input support with Safari bug workarounds
 
-- [Tailscale](https://tailscale.com/) がインストール・接続済み
-- スマートフォンも同じTailscaleネットワークに参加
+## Prerequisites
 
-## インストール
+- [Tailscale](https://tailscale.com/) installed and connected
+- Your smartphone on the same Tailscale network
+
+## Installation
 
 ```bash
 pi install git:github.com/Kohsuk3/pi-remote-control
 ```
 
-## 使い方
+## Usage
 
-Piを起動すると自動的にリモートコントロールサーバーが起動します:
+Start Pi and the remote control server launches automatically:
 
 ```
 📱 Remote Control: ポート 8920
-URL: https://your-machine.tail1234.ts.net:8920
+URL: https://your-machine.tail1234.ts.net/remote
 Session: a1b2c3d4 | Dir: /path/to/project
 /remote-toggle で切替え | /remote-status で詳細
 ```
 
-表示されたURLをスマートフォンのブラウザで開くだけです。
+Open the URL in your phone's browser. That's it.
 
-## コマンド
+The URL requires no port number — `tailscale serve` handles HTTPS on port 443 with path-based routing at `/remote`.
 
-| コマンド | 説明 |
-|----------|------|
-| `/remote-status` | 接続状態・ポート・URLを表示 |
-| `/remote-toggle` | リモートコントロールのオン/オフ切り替え |
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `/remote-status` | Show connection status, port, and URL |
+| `/remote-toggle` | Enable/disable remote control |
 
 ## Web UI
 
-モバイル最適化されたチャットインターフェース:
+A mobile-optimized chat interface:
 
-- プロンプト入力・送信
-- LLM応答のリアルタイムストリーミング表示
-- ツール実行状況の表示
-- モデル選択（ヘッダーのモデル名をタップ）
-- セッション切り替え（ヘッダーのセッションIDをタップ）
-- 中断ボタン
-- iOS日本語フリック入力対応
+- Prompt input with send button
+- Real-time LLM response streaming
+- Tool execution status display
+- Model picker (tap model name in header)
+- Session switcher (tap session ID in header)
+- Interrupt button for canceling in-progress responses
+- iOS Japanese flick input fully supported
 
-## 技術仕様
+## How It Works
 
-- **通信方式**: HTTP long-polling（WebSocket不要、全ブラウザ対応）
-- **HTTPS**: Tailscale証明書を自動取得・キャッシュ（30日で更新）
-- **ポート**: 8920から開始、衝突時は自動インクリメント
-- **依存関係**: Node.js標準モジュールのみ（外部パッケージ不要）
+### Communication
 
-## ライセンス
+HTTP long-polling (no WebSocket dependency, works on all browsers):
+
+- `GET /poll` — initial connection, returns session info + event history
+- `GET /stream` — long-poll, waits up to 25s for new events
+- `POST /send` — send a prompt to the Pi agent
+- `POST /interrupt` — cancel in-progress processing
+- `GET /models` — list available models
+- `POST /set-model` — switch the active model
+- `GET /sessions` — list all active remote-control sessions
+
+### Tailscale Integration
+
+- **`tailscale serve`** proxies `https://hostname/remote` → `http://localhost:<port>`
+- TLS termination is handled by Tailscale (no self-managed certificates)
+- Clean, bookmarkable URL with no port number
+- Path-based routing (`/remote`) avoids conflicts with other services
+
+### Multi-Session
+
+- Each Pi session gets an auto-assigned port (8920, 8921, ...)
+- Session registry at `~/.pi/remote-control/sessions.json` enables cross-process discovery
+- Dead processes are automatically cleaned up via PID checks
+- Web UI session switcher redirects to other sessions' URLs
+
+### iOS Safari Compatibility
+
+Includes workarounds for known iOS Safari bugs:
+
+- **Japanese IME `deleteCompositionText` bug** — Safari fires `deleteCompositionText` without a subsequent `insertText` when confirming composition with the 確定 button. The extension saves the pre-deletion value and restores it on `compositionend`.
+- **Auto-resize during composition** — Modifying `textarea.style.height` during IME composition cancels the composition on iOS. Resize is skipped while `composing` flag is true.
+- **Keyboard viewport** — Uses `visualViewport` API to resize layout when the software keyboard appears.
+
+## Technical Details
+
+- **Runtime**: Node.js standard modules only (no external npm packages)
+- **Port range**: 8920+ with automatic increment on collision
+- **Event buffer**: Last 100 events retained per session
+- **Streaming throttle**: `message_update` events throttled to 200ms intervals
+
+## License
 
 MIT
