@@ -18,7 +18,6 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import http from "node:http";
-import https from "node:https";
 import net from "node:net";
 import crypto from "node:crypto";
 import path from "node:path";
@@ -36,7 +35,7 @@ interface WaitingClient {
 }
 
 interface ServerInstance {
-  httpServer: http.Server | https.Server;
+  httpServer: http.Server;
   port: number;
   url: string;
   workingDir: string;
@@ -154,38 +153,33 @@ function getTailscaleIP(): string {
   }
 }
 
-/** TLS 証明書を取得・キャッシュ（30 日で自動更新） */
-function ensureTLSCerts(fqdn: string): { cert: Buffer; key: Buffer } | null {
-  if (!fqdn) return null;
-  const certDir = path.join(os.homedir(), ".pi", "remote-control", "certs");
-  const certPath = path.join(certDir, "cert.pem");
-  const keyPath = path.join(certDir, "key.pem");
+const SERVE_PATH = "/remote";
 
+/** tailscale serve でパスベースのプロキシを設定（TLS終端はtailscaleが担当） */
+function setupTailscaleServe(port: number): boolean {
   try {
-    let needRefresh = true;
-    try {
-      const ageMs = Date.now() - fsSync.statSync(certPath).mtimeMs;
-      needRefresh = ageMs > 30 * 24 * 60 * 60 * 1000;
-    } catch { /* ファイルがない */ }
-
-    if (needRefresh) {
-      fsSync.mkdirSync(certDir, { recursive: true });
-      execSync(
-        `tailscale cert --cert-file "${certPath}" --key-file "${keyPath}" "${fqdn}"`,
-        { stdio: "ignore" },
-      );
-    }
-    return { cert: fsSync.readFileSync(certPath), key: fsSync.readFileSync(keyPath) };
+    execSync(
+      `tailscale serve --bg --set-path ${SERVE_PATH} http://localhost:${port}`,
+      { stdio: "ignore" },
+    );
+    return true;
   } catch {
-    return null;
+    return false;
   }
 }
 
+function teardownTailscaleServe(): void {
+  try {
+    execSync(`tailscale serve --set-path ${SERVE_PATH} off`, { stdio: "ignore" });
+  } catch { /* ignore */ }
+}
+
 /** リモートアクセス URL を生成 */
-function buildRemoteUrl(port: number, fqdn: string, isHTTPS: boolean): string {
-  const host = isHTTPS && fqdn ? fqdn : getTailscaleIP();
-  const proto = isHTTPS ? "https" : "http";
-  return `${proto}://${host}:${port}`;
+function buildRemoteUrl(port: number, fqdn: string, useTailscaleServe: boolean): string {
+  if (useTailscaleServe && fqdn) {
+    return `https://${fqdn}${SERVE_PATH}`;
+  }
+  return `http://${getTailscaleIP()}:${port}`;
 }
 
 // ─── ポート検索 ────────────────────────────────────────────────
@@ -614,13 +608,10 @@ async function startServer(
   const html = generateHTML();
 
   const fqdn = getTailscaleFQDN();
-  const tlsCerts = ensureTLSCerts(fqdn);
-  const isHTTPS = !!tlsCerts;
-  const url = buildRemoteUrl(port, fqdn, isHTTPS);
+  const useTailscaleServe = !!fqdn && setupTailscaleServe(port);
+  const url = buildRemoteUrl(port, fqdn, useTailscaleServe);
 
-  const httpServer = tlsCerts
-    ? https.createServer({ cert: tlsCerts.cert, key: tlsCerts.key })
-    : http.createServer();
+  const httpServer = http.createServer();
 
   const instance: ServerInstance = {
     httpServer,
@@ -808,6 +799,7 @@ function stopServer(sessionId: string): void {
   occupiedPorts.delete(s.port);
   sessionServers.delete(sessionId);
   unregisterSession(sessionId);
+  teardownTailscaleServe();
 }
 
 // ─── 拡張機能エントリーポイント ────────────────────────────────
