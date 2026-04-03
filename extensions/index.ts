@@ -291,6 +291,9 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 
 <script>
 const $=s=>document.getElementById(s);
+// tailscale serve のパスプレフィックスを自動検出
+const BASE=(()=>{const p=location.pathname.replace(/\/$/,'');return p||'';})();
+function api(path){return BASE+path;}
 const msgs=$("msgs"), inp=$("inp"), dot=$("dot"), hm=$("hm"), sndBtn=$("snd"), stpBtn=$("stp");
 let lastId=0, processing=false, streamEl=null, sentLocally=false;
 
@@ -380,7 +383,7 @@ function handleEvents(events){
 
 async function init(){
   try{
-    const r=await fetch("/poll?since=0");
+    const r=await fetch(api("/poll?since=0"));
     const d=await r.json();
     if(d.sessionId){
       dot.className="dot ok";
@@ -397,7 +400,7 @@ async function init(){
 async function streamLoop(){
   while(true){
     try{
-      const r=await fetch("/stream?since="+lastId);
+      const r=await fetch(api("/stream?since="+lastId));
       const d=await r.json();
       dot.className="dot ok";
       handleEvents(d.events||[]);
@@ -417,7 +420,7 @@ async function send(){
   inp.style.height="auto";
   setProcessing(true);
   try{
-    await fetch("/send",{
+    await fetch(api("/send"),{
       method:"POST",
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({content:t}),
@@ -429,7 +432,7 @@ async function send(){
 }
 
 async function interrupt(){
-  try{ await fetch("/interrupt",{method:"POST"}); } catch(e){}
+  try{ await fetch(api("/interrupt"),{method:"POST"}); } catch(e){}
   setProcessing(false);
   addM("s","⛔ 中断要求送信");
 }
@@ -448,7 +451,7 @@ function updateSessionLabel(sid){
 
 async function openSessionPicker(){
   try{
-    const r=await fetch('/sessions');
+    const r=await fetch(api('/sessions'));
     const d=await r.json();
     const sessions=d.sessions||[];
     const cur=d.current||'';
@@ -482,7 +485,7 @@ let currentModelId='', models=[];
 
 async function fetchModels(){
   try{
-    const r=await fetch('/models');
+    const r=await fetch(api('/models'));
     const d=await r.json();
     models=d.models||[];
     currentModelId=d.current||'';
@@ -515,7 +518,7 @@ async function selectModel(provider,id){
   closeModelPicker();
   mdlBtn.textContent='...';
   try{
-    const r=await fetch('/set-model',{
+    const r=await fetch(api('/set-model'),{
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({provider,id}),
