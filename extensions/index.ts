@@ -292,7 +292,7 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 <script>
 const $=s=>document.getElementById(s);
 // tailscale serve のパスプレフィックスを自動検出
-const BASE=(()=>{const p=location.pathname.replace(/\/$/,'');return p||'';})();
+const BASE=(()=>{const p=location.pathname.replace(/\\/$/, '');return p||'';})();
 function api(path){return BASE+path;}
 const msgs=$("msgs"), inp=$("inp"), dot=$("dot"), hm=$("hm"), sndBtn=$("snd"), stpBtn=$("stp");
 let lastId=0, processing=false, streamEl=null, sentLocally=false;
