@@ -121,6 +121,7 @@ interface RegistryEntry {
   sessionId: string;
   port: number;
   url: string;
+  directUrl: string; // Tailscale IP + ポートの直接URL（セッション切り替え用）
   workingDir: string;
   pid: number;
 }
@@ -627,7 +628,7 @@ async function openSessionPicker(){
         '</span><span class="mi-name">'+dir+
         '</span><span class="mi-prov">:'+s.port+'</span>';
       item.onclick=()=>{
-        if(s.sessionId!==cur) window.location.href=s.url;
+        if(s.sessionId!==cur) window.location.href=s.directUrl||s.url;
         closeSessionPicker();
       };
       sessList.appendChild(item);
@@ -942,7 +943,8 @@ async function startServer(
       `/remote-toggle で切替え | /remote-status で詳細`,
     ].join("\n"), "info");
     ctx.ui.setStatus("remote-ctrl", ctx.ui.theme.fg("success", `📱 :${port}`));
-    registerSession({ sessionId, port, url, workingDir, pid: process.pid });
+    const directUrl = `http://${getTailscaleIP()}:${port}`;
+    registerSession({ sessionId, port, url, directUrl, workingDir, pid: process.pid });
   });
 
   httpServer.on("error", (err: Error) => {
