@@ -16,6 +16,7 @@ Securely connect over HTTPS and interact with Pi through a mobile-optimized Web 
 - 🖥️ **Dual input** — both host Pi and Web UI can send prompts, with shared history
 - 🔢 **Multi-session** — automatic port assignment per session
 - 📜 **Session history** — see past conversation when connecting mid-session
+- ✅ **Confirmation dialogs** — respond to `ctx.ui.confirm()` from the Web UI or TUI, whichever comes first
 - 🇯🇵 **iOS Japanese IME** — full flick input support with Safari bug workarounds
 
 ## Prerequisites
@@ -61,6 +62,7 @@ A mobile-optimized chat interface:
 - Model picker (tap model name in header)
 - Session switcher (tap session ID in header)
 - Interrupt button for canceling in-progress responses
+- **Confirmation dialogs** — Yes/No modal with countdown timer
 - iOS Japanese flick input fully supported
 
 ## How It Works
@@ -76,6 +78,7 @@ HTTP long-polling (no WebSocket dependency, works on all browsers):
 - `GET /models` — list available models
 - `POST /set-model` — switch the active model
 - `GET /sessions` — list all active remote-control sessions
+- `POST /confirm/respond` — respond to a confirmation dialog (`{ confirmId, confirmed: boolean }`)
 
 ### Tailscale Integration
 
@@ -99,12 +102,31 @@ Includes workarounds for known iOS Safari bugs:
 - **Auto-resize during composition** — Modifying `textarea.style.height` during IME composition cancels the composition on iOS. Resize is skipped while `composing` flag is true.
 - **Keyboard viewport** — Uses `visualViewport` API to resize layout when the software keyboard appears.
 
+### Confirmation Dialogs
+
+Extensions that call `ctx.ui.confirm()` (e.g. a file-delete guard) can expose the dialog to the Web UI:
+
+1. The extension calls `(globalThis as any).__remoteConfirm(title, message, timeoutSec)` instead of (or alongside) `ctx.ui.confirm()`.
+2. A `confirm:request` event is pushed to all connected Web UI clients.
+3. The Web UI shows a modal with **Yes** and **No** buttons and a countdown timer.
+4. The user taps a button → `POST /confirm/respond` → the Promise resolves and the extension continues.
+
+When both the TUI and Web UI are active, whichever responds first wins. The other dialog is closed automatically (`AbortSignal` for TUI, `confirm:resolved` event for Web UI).
+
+**Globals exposed by this extension (same Node.js process):**
+
+| Global | Type | Description |
+|--------|------|-------------|
+| `__remoteConfirm` | `(title, message, timeoutSec) => Promise<boolean>` | Request a confirmation from Web UI |
+| `__remoteCancelConfirm` | `(confirmed: boolean) => void` | Force-resolve the latest pending dialog (call when TUI responds first) |
+
 ## Technical Details
 
 - **Runtime**: Node.js standard modules only (no external npm packages)
 - **Port range**: 8920+ with automatic increment on collision
 - **Event buffer**: Last 100 events retained per session
 - **Streaming throttle**: `message_update` events throttled to 200ms intervals
+- **Confirm timeout**: Default 120 s; auto-resolves as `false` (rejected) on expiry
 
 ## License
 
