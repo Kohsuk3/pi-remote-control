@@ -46,10 +46,48 @@ interface ServerInstance {
   nextEventId: number;
 }
 
-// ─── グローバル状態（複数セッション間で共有） ──────────────────
+// ─── プロセス内状態 ────────────────────────────────────────────
 
 const occupiedPorts = new Set<number>();
 const sessionServers = new Map<string, ServerInstance>();
+
+// ─── プロセス間共有セッションレジストリ（ファイルベース） ──────
+
+const REGISTRY_PATH = path.join(os.homedir(), ".pi", "remote-control", "sessions.json");
+
+interface RegistryEntry {
+  sessionId: string;
+  port: number;
+  url: string;
+  workingDir: string;
+  pid: number;
+}
+
+function readRegistry(): RegistryEntry[] {
+  try {
+    const data = JSON.parse(fsSync.readFileSync(REGISTRY_PATH, "utf-8"));
+    return (data as RegistryEntry[]).filter(e => {
+      try { process.kill(e.pid, 0); return true; } catch { return false; }
+    });
+  } catch { return []; }
+}
+
+function writeRegistry(entries: RegistryEntry[]): void {
+  try {
+    fsSync.mkdirSync(path.dirname(REGISTRY_PATH), { recursive: true });
+    fsSync.writeFileSync(REGISTRY_PATH, JSON.stringify(entries, null, 2));
+  } catch { /* ignore */ }
+}
+
+function registerSession(entry: RegistryEntry): void {
+  const entries = readRegistry().filter(e => e.sessionId !== entry.sessionId);
+  entries.push(entry);
+  writeRegistry(entries);
+}
+
+function unregisterSession(sessionId: string): void {
+  writeRegistry(readRegistry().filter(e => e.sessionId !== sessionId));
+}
 
 // ─── ユーティリティ ────────────────────────────────────────────
 
@@ -676,12 +714,7 @@ async function startServer(
 
     // 全アクティブセッション一覧
     if (pathname === "/sessions") {
-      const sessions = Array.from(sessionServers.values()).map(s => ({
-        sessionId: s.sessionId,
-        port: s.port,
-        url: s.url,
-        workingDir: s.workingDir,
-      }));
+      const sessions = readRegistry();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ sessions, current: sessionId }));
       return;
@@ -755,6 +788,7 @@ async function startServer(
       `/remote-toggle で切替え | /remote-status で詳細`,
     ].join("\n"), "info");
     ctx.ui.setStatus("remote-ctrl", ctx.ui.theme.fg("success", `📱 :${port}`));
+    registerSession({ sessionId, port, url, workingDir, pid: process.pid });
   });
 
   httpServer.on("error", (err: Error) => {
@@ -773,6 +807,7 @@ function stopServer(sessionId: string): void {
   s.httpServer.close(() => {});
   occupiedPorts.delete(s.port);
   sessionServers.delete(sessionId);
+  unregisterSession(sessionId);
 }
 
 // ─── 拡張機能エントリーポイント ────────────────────────────────
