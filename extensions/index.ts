@@ -10,6 +10,7 @@
  *   - Web UI / ホスト双方からのプロンプト入力・LLM応答のリアルタイム表示
  *   - セッションごとのポート自動割り当て（複数セッション対応）
  *   - ツール実行状況の表示
+ *   - ctx.ui.confirm() 対応 — Web UI で確認ダイアログの Yes/No を操作可能
  *
  * コマンド:
  *   /remote-status  接続状態とポート情報を表示
@@ -43,6 +44,68 @@ interface ServerInstance {
   eventLog: Evt[];
   waitingClients: Map<string, WaitingClient>;
   nextEventId: number;
+}
+
+// ─── 確認ダイアログ管理 ────────────────────────────────────────
+
+interface PendingConfirm {
+  id: string;
+  title: string;
+  message: string;
+  resolve: (confirmed: boolean) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+const pendingConfirms = new Map<string, PendingConfirm>();
+
+/** 拡張機能が確認ダイアログを要求 → Web UIに配信し、応答を待つ */
+function requestWebConfirm(title: string, message: string, timeoutSeconds: number = 60): Promise<boolean> {
+  const id = `confirm_${crypto.randomUUID().slice(0, 8)}`;
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => {
+      pendingConfirms.delete(id);
+      resolve(false); // タイムアウトは拒否扱い
+    }, timeoutSeconds * 1000);
+    pendingConfirms.set(id, { id, title, message, resolve, timer });
+    // 全アクティブセッションに確認リクエストを配信
+    for (const [_, s] of sessionServers) {
+      pushEvent(s.sessionId, {
+        type: "confirm:request",
+        confirmId: id,
+        title,
+        message,
+        timeoutSeconds,
+      });
+    }
+  });
+}
+
+/** Web UIから確認レスポンスを受信 → 待機中のPromiseを解決 */
+function respondWebConfirm(confirmId: string, confirmed: boolean): void {
+  const pending = pendingConfirms.get(confirmId);
+  if (pending) {
+    clearTimeout(pending.timer);
+    pendingConfirms.delete(confirmId);
+    pending.resolve(confirmed);
+  }
+}
+
+/**
+ * TUI側が先に応答した場合にWEB UIに「既に解決済み」を通知する。
+ * confirmId を省略すると最新の pending を対象にする。
+ */
+function cancelWebConfirm(confirmed: boolean, confirmId?: string): void {
+  const id = confirmId ?? [...pendingConfirms.keys()].at(-1);
+  if (!id) return;
+  const pending = pendingConfirms.get(id);
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  pendingConfirms.delete(id);
+  pending.resolve(confirmed);
+  // WEB UI にも「解決済み」イベントを配信してダイアログを閉じる
+  for (const [_, s] of sessionServers) {
+    pushEvent(s.sessionId, { type: "confirm:resolved", confirmId: id, confirmed });
+  }
 }
 
 // ─── プロセス内状態 ────────────────────────────────────────────
@@ -255,6 +318,22 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 .modal-item .mi-prov{font-size:11px;color:var(--dm);flex-shrink:0}
 #sess{font-size:11px;color:var(--dm);cursor:pointer;padding:4px 8px;border-radius:8px;background:var(--bg);border:1px solid var(--bd);white-space:nowrap;flex-shrink:0}
 #sess:active{background:var(--bd)}
+/* ── 確認ダイアログ ───────────────────────── */
+.confirm-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:200;align-items:center;justify-content:center;padding:20px}
+.confirm-overlay.show{display:flex}
+.confirm-modal{background:var(--sf);border:1px solid var(--bd);border-radius:16px;width:100%;max-width:480px;box-shadow:0 16px 48px rgba(0,0,0,.5);animation:confirmIn .2s ease-out}
+@keyframes confirmIn{from{opacity:0;transform:scale(.95)}to{opacity:1;transform:scale(1)}}
+.confirm-header{padding:16px 16px 12px;border-bottom:1px solid var(--bd)}
+.confirm-header h3{font-size:16px;color:var(--er);margin:0;white-space:pre-wrap;word-break:break-word}
+.confirm-body{padding:16px;font-size:14px;line-height:1.6;max-height:40vh;overflow-y:auto;-webkit-user-select:text;user-select:text;white-space:pre-wrap;word-break:break-word;font-family:var(--fm)}
+.confirm-footer{padding:12px 16px 20px;border-top:1px solid var(--bd);display:flex;gap:12px;justify-content:flex-end}
+.confirm-footer button{padding:10px 24px;border-radius:10px;border:none;font-size:14px;font-weight:600;cursor:pointer;font-family:var(--fn);transition:opacity .15s}
+.confirm-footer button:active{transform:scale(.96)}
+.btn-no{background:var(--bd);color:var(--tx)}
+.btn-no:hover{opacity:.85}
+.btn-yes{background:var(--er);color:#fff}
+.btn-yes:hover{opacity:.85}
+.confirm-timer{padding:0 16px 8px;font-size:12px;color:var(--dm);text-align:center}
 </style>
 </head>
 <body>
@@ -283,6 +362,19 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 
 <div id="msgs" class="chat"></div>
 
+<!-- 確認ダイアログ -->
+<div id="confirmOverlay" class="confirm-overlay" onclick="closeConfirm()">
+  <div class="confirm-modal" onclick="event.stopPropagation()">
+    <div class="confirm-header"><h3 id="confirmTitle"></h3></div>
+    <div class="confirm-body" id="confirmBody"></div>
+    <div class="confirm-timer" id="confirmTimer"></div>
+    <div class="confirm-footer">
+      <button class="btn-no" onclick="respondConfirm(false)">No</button>
+      <button class="btn-yes" onclick="respondConfirm(true)">Yes</button>
+    </div>
+  </div>
+</div>
+
 <div class="ia">
   <textarea id="inp" placeholder="プロンプトを入力…" rows="1"></textarea>
   <button id="snd" class="b snd"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></button>
@@ -291,11 +383,11 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 
 <script>
 const $=s=>document.getElementById(s);
-// tailscale serve のパスプレフィックスを自動検出
 const BASE=(()=>{const p=location.pathname.replace(/\\/$/, '');return p||'';})();
 function api(path){return BASE+path;}
 const msgs=$("msgs"), inp=$("inp"), dot=$("dot"), hm=$("hm"), sndBtn=$("snd"), stpBtn=$("stp");
 let lastId=0, processing=false, streamEl=null, sentLocally=false;
+let currentConfirmId=null, confirmTimerEl=null;
 
 function addM(cls,text){
   const d=document.createElement("div");
@@ -321,6 +413,61 @@ function setProcessing(v){
   }
 }
 
+// ── 確認ダイアログ ────────────────────────
+function showConfirm(confirmId, title, message, timeoutSec) {
+  currentConfirmId = confirmId;
+  $("confirmTitle").textContent = title;
+  $("confirmBody").textContent = message;
+  $("confirmOverlay").classList.add("show");
+  // タイマー表示
+  if (timeoutSec > 0) {
+    let remaining = timeoutSec;
+    $("confirmTimer").textContent = remaining + "秒後に自動拒否";
+    confirmTimerEl = setInterval(() => {
+      remaining--;
+      if (remaining <= 0) {
+        clearInterval(confirmTimerEl);
+        $("confirmTimer").textContent = "";
+      } else {
+        $("confirmTimer").textContent = remaining + "秒後に自動拒否";
+      }
+    }, 1000);
+  } else {
+    $("confirmTimer").textContent = "";
+  }
+}
+
+function closeConfirm() {
+  if (!currentConfirmId) return;
+  const id = currentConfirmId;
+  currentConfirmId = null;
+  if (confirmTimerEl) clearInterval(confirmTimerEl);
+  confirmTimerEl = null;
+  $("confirmOverlay").classList.remove("show");
+  // キャンセル = 拒否
+  respondToServer(id, false);
+}
+
+function respondConfirm(confirmed) {
+  if (!currentConfirmId) return;
+  const id = currentConfirmId;
+  currentConfirmId = null;
+  if (confirmTimerEl) clearInterval(confirmTimerEl);
+  confirmTimerEl = null;
+  $("confirmOverlay").classList.remove("show");
+  respondToServer(id, confirmed);
+}
+
+async function respondToServer(confirmId, confirmed) {
+  try {
+    await fetch(api("/confirm/respond"), {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ confirmId, confirmed }),
+    });
+  } catch(e) { console.error("Confirm response failed:", e); }
+}
+
 function handleEvents(events){
   for(const ev of events){
     if(ev.id!==undefined && ev.id>lastId) lastId=ev.id;
@@ -330,9 +477,21 @@ function handleEvents(events){
         streamEl=null;
         break;
       case "user:message":
-        // Web UIから送信した直後のエコーは重複表示しない
         if(sentLocally){ sentLocally=false; }
         else { addM("u",ev.text||""); }
+        break;
+      case "confirm:request":
+        showConfirm(ev.confirmId, ev.title||"確認", ev.message||"", ev.timeoutSeconds||60);
+        break;
+      case "confirm:resolved":
+        // TUI側が先に応答 → モーダルを閉じる（応答は送らない）
+        if (currentConfirmId === ev.confirmId) {
+          currentConfirmId = null;
+          if (confirmTimerEl) clearInterval(confirmTimerEl);
+          confirmTimerEl = null;
+          $("confirmOverlay").classList.remove("show");
+          addM("s", ev.confirmed ? "✅ ホストで承認済み" : "🚫 ホストで拒否済み");
+        }
         break;
       case "response:update":
         if(!streamEl){
@@ -539,55 +698,35 @@ async function selectModel(provider,id){
   }
 }
 
-// iOS Safari バグ対策:
-// 日本語 IME で確定ボタンを押すと deleteCompositionText が発火して
-// テキストが消えるが、後続の insertText が発火しない。
-// → deleteCompositionText 直前の値を保存し compositionend 後に復元。
+// iOS Safari バグ対策
 let composing=false, savedBeforeDelete=null;
 
-inp.addEventListener("compositionstart",()=>{
-  composing=true;
-  savedBeforeDelete=null;
-});
-
+inp.addEventListener("compositionstart",()=>{ composing=true; savedBeforeDelete=null; });
 inp.addEventListener("beforeinput",e=>{
-  if(e.inputType==="deleteCompositionText"){
-    savedBeforeDelete=inp.value;
-  } else if(e.inputType==="insertText"||e.inputType==="insertFromComposition"){
-    savedBeforeDelete=null;
-  }
+  if(e.inputType==="deleteCompositionText"){ savedBeforeDelete=inp.value; }
+  else if(e.inputType==="insertText"||e.inputType==="insertFromComposition"){ savedBeforeDelete=null; }
 });
-
 inp.addEventListener("compositionend",()=>{
   composing=false;
-  if(savedBeforeDelete!==null){
-    inp.value=savedBeforeDelete;
-  }
+  if(savedBeforeDelete!==null){ inp.value=savedBeforeDelete; }
   savedBeforeDelete=null;
 });
 
-// Enter で送信（IME 変換中はスキップ）
 inp.addEventListener("keydown",e=>{
   if(e.key==="Enter"&&!e.shiftKey&&!processing&&!composing&&!e.isComposing){
-    e.preventDefault();
-    send();
+    e.preventDefault(); send();
   }
 });
 
-// テキストエリア自動リサイズ（IME 変換中はスキップ — iOS で変換がキャンセルされるため）
 inp.addEventListener("input",()=>{
   if(composing) return;
   inp.style.height="auto";
   inp.style.height=Math.min(120,inp.scrollHeight)+"px";
 });
 
-// iOS: キーボード表示時にvisualViewportの高さに合わせてレイアウトを縮小
 if(window.visualViewport){
   const vv=window.visualViewport;
-  function fitToViewport(){
-    document.body.style.height=vv.height+'px';
-    window.scrollTo(0,0);
-  }
+  function fitToViewport(){ document.body.style.height=vv.height+'px'; window.scrollTo(0,0); }
   vv.addEventListener('resize',fitToViewport);
   vv.addEventListener('scroll',()=>window.scrollTo(0,0));
   fitToViewport();
@@ -706,6 +845,27 @@ async function startServer(
       return;
     }
 
+    // 確認レスポンス受信 → 待機中の confirm を解決
+    if (req.method === "POST" && pathname === "/confirm/respond") {
+      const body = await readBody(req);
+      try {
+        const { confirmId, confirmed } = JSON.parse(body);
+        if (confirmId !== undefined && typeof confirmed === "boolean") {
+          respondWebConfirm(confirmId, confirmed);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end('{"ok":true}');
+          ctx.ui.notify(`📱 確認応答: confirmId=${confirmId} → ${confirmed ? "Yes" : "No"}`, "info");
+        } else {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "confirmId(boolean) required" }));
+        }
+      } catch (e: unknown) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e instanceof Error ? e.message : "parse error" }));
+      }
+      return;
+    }
+
     // 全アクティブセッション一覧
     if (pathname === "/sessions") {
       const sessions = readRegistry();
@@ -815,6 +975,12 @@ export default function (pi: ExtensionAPI) {
   let isRemoteEnabled = true;
   let isServerRunning = false;
 
+  // リモート確認APIを公開 — file-delete-guard 等から利用可能
+  (globalThis as any).__remoteConfirm = requestWebConfirm;
+  (globalThis as any).__remoteRespond = respondWebConfirm;
+  // TUI側が先に応答した場合にWEB UI側を閉じる
+  (globalThis as any).__remoteCancelConfirm = cancelWebConfirm;
+
   pi.on("session_start", async (_e, ctx) => {
     workingDir = ctx.cwd;
     sessionId = crypto.randomUUID().slice(0, 8);
@@ -896,6 +1062,9 @@ export default function (pi: ExtensionAPI) {
     if (isServerRunning) stopServer(sessionId);
     serverPort = null;
     isServerRunning = false;
+    // shutdown時にグローバル参照をクリア
+    delete (globalThis as any).__remoteConfirm;
+    delete (globalThis as any).__remoteRespond;
   });
 
   pi.registerCommand("remote-status", {
