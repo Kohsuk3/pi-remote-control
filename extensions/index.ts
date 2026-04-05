@@ -984,15 +984,18 @@ async function startServer(
   });
 
   httpServer.listen(port, "0.0.0.0", () => {
-    ctx.ui.notify([
-      `📱 Remote Control: ポート ${port}`,
-      `URL: ${url}`,
-      `Session: ${sessionId} | Dir: ${workingDir}`,
-      `/remote-toggle で切替え | /remote-status で詳細`,
-    ].join("\n"), "info");
     ctx.ui.setStatus("remote-ctrl", ctx.ui.theme.fg("success", `📱 :${port}`));
     const directUrl = `http://${getTailscaleIP()}:${port}`;
     registerSession({ sessionId, port, url, directUrl, workingDir, pid: process.pid });
+    // 他の拡張（Python LSP 等）の session_start 通知が出終わった後に表示されるよう遅延
+    setTimeout(() => {
+      ctx.ui.notify([
+        `📱 Remote Control: ポート ${port}`,
+        `URL: ${url}`,
+        `Session: ${sessionId} | Dir: ${workingDir}`,
+        `/remote-toggle で切替え | /remote-status で詳細`,
+      ].join("\n"), "info");
+    }, 1500);
   });
 
   httpServer.on("error", (err: Error) => {
