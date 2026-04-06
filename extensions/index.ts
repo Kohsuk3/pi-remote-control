@@ -238,16 +238,31 @@ function listSubdirectories(dirPath: string): { name: string; path: string }[] {
 /** 全スポーン済み子プロセスを終了 */
 function cleanupSpawnedSessions(): void {
   for (const [pid, s] of spawnedSessions) {
+    killSpawnedSession(pid);
+  }
+  spawnedSessions.clear();
+}
+
+/** 指定 PID のセッションを終了する。成功時 true、見つからない or 失敗時 false */
+function killSpawnedSession(pid: number): boolean {
+  const s = spawnedSessions.get(pid);
+  if (s) {
     try {
-      // stdin を閉じて RPC モードを終了させる
       s.proc.stdin?.end();
-      // 少し待ってからkill
       setTimeout(() => {
         try { process.kill(pid, "SIGTERM"); } catch { /* already dead */ }
       }, 1000);
     } catch { /* ignore */ }
+    spawnedSessions.delete(pid);
+    return true;
   }
-  spawnedSessions.clear();
+  // スポーンした子ではないが、レジストリ上の他プロセスを SIGTERM で終了
+  try {
+    process.kill(pid, "SIGTERM");
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ─── プロセス間共有セッションレジストリ（ファイルベース） ──────
@@ -500,6 +515,8 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 .sb-item-sub{font-size:11px;color:var(--dm);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--fm)}
 .sb-cur-dot{width:8px;height:8px;border-radius:50%;background:var(--ok);flex-shrink:0;box-shadow:0 0 6px var(--ok)}
 .sb-item-badge{font-size:10px;font-weight:600;color:var(--ac);background:rgba(124,58,237,.15);padding:3px 8px;border-radius:20px;border:1px solid rgba(124,58,237,.3);flex-shrink:0;white-space:nowrap}
+.sb-item-close{width:28px;height:28px;border-radius:50%;border:none;background:transparent;color:var(--dm);font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;-webkit-tap-highlight-color:transparent;transition:background .15s,color .15s}
+.sb-item-close:active{background:rgba(239,68,68,.15);color:var(--er)}
 
 /* ── 新規セッション ────────────────────────── */
 .sb-new-btn{display:flex;align-items:center;gap:10px;padding:14px 16px;cursor:pointer;border-radius:10px;margin:8px 8px 2px;border:1px dashed var(--bd);color:var(--ac);font-size:13px;font-weight:600;transition:background .15s}
@@ -659,7 +676,7 @@ async function loadSidebarSessions(){
       item.innerHTML=
         '<div class="sb-item-icon">'+(isCur?'🖥️':'💻')+'</div>'+
         '<div class="sb-item-body">'+
-          '<div class="sb-item-name">'+dir+'</div>'+
+          '<div class="sb-item-name">'+esc(dir)+'</div>'+
           '<div class="sb-item-sub">'+s.sessionId+' · :'+s.port+'</div>'+
         '</div>'+
         (isCur?'<div class="sb-cur-dot"></div>':'<div class="sb-item-badge">切替</div>');
@@ -667,10 +684,47 @@ async function loadSidebarSessions(){
         closeSidebar();
         if(!isCur) window.location.href=s.directUrl||s.url;
       };
+      // 現在のセッション以外に閉じるボタンを追加
+      if(!isCur){
+        const closeBtn=document.createElement('button');
+        closeBtn.className='sb-item-close';
+        closeBtn.textContent='×';
+        closeBtn.title='セッションを終了';
+        closeBtn.onclick=(e)=>{
+          e.stopPropagation();
+          confirmKillSession(s.sessionId, s.pid, dir);
+        };
+        item.appendChild(closeBtn);
+      }
       list.appendChild(item);
     }
   }catch(e){
     $('sbList').innerHTML='<div style="padding:20px;color:var(--er);font-size:13px;text-align:center">読み込み失敗</div>';
+  }
+}
+
+// ── セッション終了 ──────────────────────
+function confirmKillSession(sessionId, pid, dirName){
+  if(!confirm('セッションを終了しますか？\n'+dirName+' ('+sessionId+')')) return;
+  killSession(pid);
+}
+async function killSession(pid){
+  try{
+    const r=await fetch(api('/kill-session'),{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({pid}),
+    });
+    const d=await r.json();
+    if(d.ok){
+      addM('s','🗑️ セッション終了 (pid='+pid+')');
+      // サイドバーを更新
+      loadSidebarSessions();
+    } else {
+      addM('s','❌ 終了失敗: '+(d.error||''));
+    }
+  }catch(e){
+    addM('s','❌ 通信エラー');
   }
 }
 
@@ -1282,6 +1336,38 @@ async function startServer(
       const sessions = readRegistry();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ sessions, current: sessionId }));
+      return;
+    }
+
+    // セッションを終了
+    if (req.method === "POST" && pathname === "/kill-session") {
+      const body = await readBody(req);
+      try {
+        const { pid: targetPid } = JSON.parse(body);
+        if (typeof targetPid !== "number") {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "pid (数値) は必須です" }));
+          return;
+        }
+        // 自分自身の終了は拒否
+        if (targetPid === process.pid) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "現在接続中のセッションは終了できません" }));
+          return;
+        }
+        const killed = killSpawnedSession(targetPid);
+        if (killed) {
+          ctx.ui.notify(`📱 セッション終了: pid=${targetPid}`, "info");
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+        } else {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "プロセスが見つかりません" }));
+        }
+      } catch (e: unknown) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "parse error" }));
+      }
       return;
     }
 
