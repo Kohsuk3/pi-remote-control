@@ -18,6 +18,7 @@ Securely connect over HTTPS and interact with Pi through a mobile-optimized Web 
 - 📜 **Session history** — see past conversation when connecting mid-session
 - ✅ **Confirmation dialogs** — respond to `ctx.ui.confirm()` from the Web UI or TUI, whichever comes first
 - 🚀 **Spawn sessions** — start new Pi sessions in any directory from Web UI
+- 🗑️ **Close sessions** — terminate other sessions from the sidebar
 - 🇯🇵 **iOS Japanese IME** — full flick input support with Safari bug workarounds
 
 ## Prerequisites
@@ -65,6 +66,7 @@ A mobile-optimized chat interface:
 - Interrupt button for canceling in-progress responses
 - **Confirmation dialogs** — Yes/No modal with countdown timer
 - **New session spawner** — start a new Pi session in any directory via sidebar
+- **Close session** — terminate other sessions via × button in sidebar (with confirmation)
 - iOS Japanese flick input fully supported
 
 ## How It Works
@@ -84,6 +86,7 @@ HTTP long-polling (no WebSocket dependency, works on all browsers):
 - `POST /spawn-session` — spawn a new Pi session in a specified directory (`{ cwd: string }`)
 - `GET /recent-dirs` — list recent project directories from Pi session history
 - `GET /browse?path=` — list subdirectories for the directory browser
+- `POST /kill-session` — terminate a session by PID (`{ pid: number }`)
 
 ### Tailscale Integration
 

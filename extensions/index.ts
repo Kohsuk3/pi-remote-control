@@ -123,19 +123,26 @@ interface SpawnedSession {
 
 const spawnedSessions = new Map<number, SpawnedSession>(); // pid → info
 
-/** 指定 cwd で pi --mode rpc を子プロセスとして起動 */
+/** 指定 cwd で pi --mode rpc を子プロセスとして起動
+ *  親プロセスが死んでも子が生き残るように:
+ *  - detached: true で独立プロセスグループ
+ *  - tail -f /dev/null 経由で stdin を永続化（親の pipe が壊れても EOF にならない）
+ */
 function spawnPiSession(cwd: string): { pid: number } {
-  // pi の実行パスを検索
   const piPath = findPiBinary();
 
-  const child = spawn(piPath, ["--mode", "rpc"], {
+  // nohup sh -c 'tail -f /dev/null | pi --mode rpc' で起動
+  // nohup: SIGHUP を無視して親終了時も生き残る
+  // tail -f /dev/null: stdin を開き続ける（親の pipe が壊れても EOF にならない）
+  // stdout/stderr を /dev/null にして pipe 依存を完全に断つ
+  const child = spawn("sh", ["-c", `trap '' HUP; tail -f /dev/null | exec ${piPath} --mode rpc > /dev/null 2>&1`], {
     cwd,
-    // stdin: pipe で開いたまま保持し RPC モードを維持
-    // stdout/stderr: pipe で受け取る（ignore だと書き込みエラーでプロセスが終了する）
-    stdio: ["pipe", "pipe", "pipe"],
-    detached: false,
-    env: { ...process.env },
+    stdio: ["ignore", "ignore", "ignore"],
+    detached: true,
+    env: { ...process.env, PI_REMOTE_SPAWNED: "1", PI_REMOTE_PARENT_PID: String(process.pid) },
   });
+
+  child.unref();
 
   if (!child.pid) {
     throw new Error("子プロセスの起動に失敗しました");
@@ -148,11 +155,7 @@ function spawnPiSession(cwd: string): { pid: number } {
     spawnedSessions.delete(pid);
   });
 
-  // stdin を開いたままにして RPC モードを維持
-  child.stdin?.on("error", () => {});
-  // stdout/stderr を drain してバッファ溢れを防止
-  child.stdout?.resume();
-  child.stderr?.resume();
+
 
   return { pid };
 }
@@ -169,16 +172,15 @@ function findPiBinary(): string {
   }
 }
 
-/** sessions.json にスポーンしたセッションが登録されるのを待つ */
-async function waitForSpawnedSession(pid: number, timeoutMs: number = 15000): Promise<RegistryEntry | null> {
+/** sessions.json にスポーンしたセッションが登録されるのを待つ
+ *  sh 経由で起動するため PID が変わるので、起動前のレジストリとの差分で検出 */
+async function waitForSpawnedSession(knownPids: Set<number>, timeoutMs: number = 15000): Promise<RegistryEntry | null> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     await new Promise(r => setTimeout(r, 500));
     const entries = readRegistry();
-    const entry = entries.find(e => e.pid === pid);
-    if (entry) return entry;
-    // プロセスが既に死んでいたら諦める
-    try { process.kill(pid, 0); } catch { return null; }
+    const newEntry = entries.find(e => !knownPids.has(e.pid));
+    if (newEntry) return newEntry;
   }
   return null;
 }
@@ -238,16 +240,31 @@ function listSubdirectories(dirPath: string): { name: string; path: string }[] {
 /** 全スポーン済み子プロセスを終了 */
 function cleanupSpawnedSessions(): void {
   for (const [pid, s] of spawnedSessions) {
-    try {
-      // stdin を閉じて RPC モードを終了させる
-      s.proc.stdin?.end();
-      // 少し待ってからkill
-      setTimeout(() => {
-        try { process.kill(pid, "SIGTERM"); } catch { /* already dead */ }
-      }, 1000);
-    } catch { /* ignore */ }
+    killSpawnedSession(pid);
   }
   spawnedSessions.clear();
+}
+
+/** 指定 PID のセッションを終了する。成功時 true、見つからない or 失敗時 false */
+function killSpawnedSession(pid: number): boolean {
+  const s = spawnedSessions.get(pid);
+  if (s) {
+    try {
+      // sh + tail + pi のプロセスツリーごと終了（負の PID でプロセスグループに SIGTERM）
+      process.kill(-pid, "SIGTERM");
+    } catch {
+      try { process.kill(pid, "SIGTERM"); } catch { /* already dead */ }
+    }
+    spawnedSessions.delete(pid);
+    return true;
+  }
+  // スポーンした子ではないが、レジストリ上の他プロセスを SIGTERM で終了
+  try {
+    process.kill(pid, "SIGTERM");
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ─── プロセス間共有セッションレジストリ（ファイルベース） ──────
@@ -356,8 +373,14 @@ function getTailscaleIP(): string {
 
 const SERVE_PATH = "/remote";
 
+/** スポーンされた子プロセスかどうか（子は tailscale serve を触らない） */
+let isSpawnedChild = process.env.PI_REMOTE_SPAWNED === "1";
+const parentPid = process.env.PI_REMOTE_PARENT_PID ? parseInt(process.env.PI_REMOTE_PARENT_PID, 10) : null;
+let parentWatchTimer: ReturnType<typeof setInterval> | null = null;
+
 /** tailscale serve でパスベースのプロキシを設定（TLS終端はtailscaleが担当） */
 function setupTailscaleServe(port: number): boolean {
+  if (isSpawnedChild) return false; // 子プロセスは親の設定を上書きしない
   try {
     execSync(
       `tailscale serve --bg --set-path ${SERVE_PATH} http://localhost:${port}`,
@@ -370,9 +393,30 @@ function setupTailscaleServe(port: number): boolean {
 }
 
 function teardownTailscaleServe(): void {
+  if (isSpawnedChild) return; // 子プロセスは親の設定を削除しない
   try {
     execSync(`tailscale serve --set-path ${SERVE_PATH} off`, { stdio: "ignore" });
   } catch { /* ignore */ }
+}
+
+/** 親プロセスの生存監視を開始。親が死んだら tailscale serve を引き継ぐ */
+function startParentWatcher(ownPort: number): void {
+  if (!isSpawnedChild || !parentPid) return;
+  parentWatchTimer = setInterval(() => {
+    try {
+      process.kill(parentPid, 0); // 生存確認（シグナルは送らない）
+    } catch {
+      // 親が死んだ → tailscale serve を引き継ぐ
+      isSpawnedChild = false;
+      if (parentWatchTimer) { clearInterval(parentWatchTimer); parentWatchTimer = null; }
+      const fqdn = getTailscaleFQDN();
+      if (fqdn) setupTailscaleServe(ownPort);
+    }
+  }, 5000);
+}
+
+function stopParentWatcher(): void {
+  if (parentWatchTimer) { clearInterval(parentWatchTimer); parentWatchTimer = null; }
 }
 
 /** リモートアクセス URL を生成 */
@@ -500,6 +544,8 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 .sb-item-sub{font-size:11px;color:var(--dm);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--fm)}
 .sb-cur-dot{width:8px;height:8px;border-radius:50%;background:var(--ok);flex-shrink:0;box-shadow:0 0 6px var(--ok)}
 .sb-item-badge{font-size:10px;font-weight:600;color:var(--ac);background:rgba(124,58,237,.15);padding:3px 8px;border-radius:20px;border:1px solid rgba(124,58,237,.3);flex-shrink:0;white-space:nowrap}
+.sb-item-close{width:28px;height:28px;border-radius:50%;border:none;background:transparent;color:var(--dm);font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;-webkit-tap-highlight-color:transparent;transition:background .15s,color .15s}
+.sb-item-close:active{background:rgba(239,68,68,.15);color:var(--er)}
 
 /* ── 新規セッション ────────────────────────── */
 .sb-new-btn{display:flex;align-items:center;gap:10px;padding:14px 16px;cursor:pointer;border-radius:10px;margin:8px 8px 2px;border:1px dashed var(--bd);color:var(--ac);font-size:13px;font-weight:600;transition:background .15s}
@@ -659,7 +705,7 @@ async function loadSidebarSessions(){
       item.innerHTML=
         '<div class="sb-item-icon">'+(isCur?'🖥️':'💻')+'</div>'+
         '<div class="sb-item-body">'+
-          '<div class="sb-item-name">'+dir+'</div>'+
+          '<div class="sb-item-name">'+esc(dir)+'</div>'+
           '<div class="sb-item-sub">'+s.sessionId+' · :'+s.port+'</div>'+
         '</div>'+
         (isCur?'<div class="sb-cur-dot"></div>':'<div class="sb-item-badge">切替</div>');
@@ -667,10 +713,47 @@ async function loadSidebarSessions(){
         closeSidebar();
         if(!isCur) window.location.href=s.directUrl||s.url;
       };
+      // 現在のセッション以外に閉じるボタンを追加
+      if(!isCur){
+        const closeBtn=document.createElement('button');
+        closeBtn.className='sb-item-close';
+        closeBtn.textContent='×';
+        closeBtn.title='セッションを終了';
+        closeBtn.onclick=(e)=>{
+          e.stopPropagation();
+          confirmKillSession(s.sessionId, s.pid, dir);
+        };
+        item.appendChild(closeBtn);
+      }
       list.appendChild(item);
     }
   }catch(e){
     $('sbList').innerHTML='<div style="padding:20px;color:var(--er);font-size:13px;text-align:center">読み込み失敗</div>';
+  }
+}
+
+// ── セッション終了 ──────────────────────
+function confirmKillSession(sessionId, pid, dirName){
+  if(!confirm('セッションを終了しますか？\\n'+dirName+' ('+sessionId+')')) return;
+  killSession(pid);
+}
+async function killSession(pid){
+  try{
+    const r=await fetch(api('/kill-session'),{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({pid}),
+    });
+    const d=await r.json();
+    if(d.ok){
+      addM('s','🗑️ セッション終了 (pid='+pid+')');
+      // プロセス終了の反映を待ってサイドバーを更新
+      setTimeout(loadSidebarSessions, 1500);
+    } else {
+      addM('s','❌ 終了失敗: '+(d.error||''));
+    }
+  }catch(e){
+    addM('s','❌ 通信エラー');
   }
 }
 
@@ -1285,6 +1368,40 @@ async function startServer(
       return;
     }
 
+    // セッションを終了
+    if (req.method === "POST" && pathname === "/kill-session") {
+      const body = await readBody(req);
+      try {
+        const { pid: targetPid } = JSON.parse(body);
+        if (typeof targetPid !== "number") {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "pid (数値) は必須です" }));
+          return;
+        }
+        // 自分自身の終了は拒否
+        if (targetPid === process.pid) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "現在接続中のセッションは終了できません" }));
+          return;
+        }
+        const killed = killSpawnedSession(targetPid);
+        if (killed) {
+          ctx.ui.notify(`📱 セッション終了: pid=${targetPid}`, "info");
+          // 子プロセスが tailscale serve を壊した場合の安全策: 親の設定を復元
+          setupTailscaleServe(port);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+        } else {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "プロセスが見つかりません" }));
+        }
+      } catch (e: unknown) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "parse error" }));
+      }
+      return;
+    }
+
     // 最近のプロジェクトディレクトリ一覧
     if (pathname === "/recent-dirs") {
       const dirs = getRecentProjectDirs();
@@ -1323,13 +1440,15 @@ async function startServer(
           return;
         }
         ctx.ui.notify(`📱 新セッション起動: ${targetCwd}`, "info");
-        const { pid } = spawnPiSession(targetCwd);
-        // sessions.json に登録されるのを待つ
-        const entry = await waitForSpawnedSession(pid);
+        // 起動前のレジストリ PID を記録
+        const knownPids = new Set(readRegistry().map(e => e.pid));
+        const { pid: shPid } = spawnPiSession(targetCwd);
+        // sessions.json に新エントリが登録されるのを待つ
+        const entry = await waitForSpawnedSession(knownPids);
         if (entry) {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true, session: entry }));
-          ctx.ui.notify(`📱 新セッション起動完了: ${entry.sessionId} (pid=${pid})`, "success");
+          ctx.ui.notify(`📱 新セッション起動完了: ${entry.sessionId} (pid=${entry.pid})`, "success");
         } else {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: false, error: "セッション起動がタイムアウトしました" }));
@@ -1405,6 +1524,8 @@ async function startServer(
     ctx.ui.setStatus("remote-ctrl", ctx.ui.theme.fg("success", `📱 :${port}`));
     const directUrl = `http://${getTailscaleIP()}:${port}`;
     registerSession({ sessionId, port, url, directUrl, workingDir, pid: process.pid });
+    // 親プロセスの生存監視を開始（子プロセスのみ）
+    startParentWatcher(port);
     // 他の拡張（Python LSP 等）の session_start 通知が出終わった後に表示されるよう遅延
     setTimeout(() => {
       ctx.ui.notify([
@@ -1427,6 +1548,7 @@ async function startServer(
 function stopServer(sessionId: string): void {
   const s = sessionServers.get(sessionId);
   if (!s) return;
+  stopParentWatcher();
   pushEvent(sessionId, { type: "server:shutdown" });
   for (const wc of s.waitingClients.values()) clearTimeout(wc.timer);
   s.httpServer.close(() => {});
