@@ -747,8 +747,8 @@ async function killSession(pid){
     const d=await r.json();
     if(d.ok){
       addM('s','🗑️ セッション終了 (pid='+pid+')');
-      // サイドバーを更新
-      loadSidebarSessions();
+      // プロセス終了の反映を待ってサイドバーを更新
+      setTimeout(loadSidebarSessions, 1500);
     } else {
       addM('s','❌ 終了失敗: '+(d.error||''));
     }
