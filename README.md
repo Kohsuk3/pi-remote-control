@@ -17,6 +17,7 @@ Securely connect over HTTPS and interact with Pi through a mobile-optimized Web 
 - 🔢 **Multi-session** — automatic port assignment per session
 - 📜 **Session history** — see past conversation when connecting mid-session
 - ✅ **Confirmation dialogs** — respond to `ctx.ui.confirm()` from the Web UI or TUI, whichever comes first
+- 🚀 **Spawn sessions** — start new Pi sessions in any directory from Web UI
 - 🇯🇵 **iOS Japanese IME** — full flick input support with Safari bug workarounds
 
 ## Prerequisites
@@ -63,6 +64,7 @@ A mobile-optimized chat interface:
 - Session switcher (tap session ID in header)
 - Interrupt button for canceling in-progress responses
 - **Confirmation dialogs** — Yes/No modal with countdown timer
+- **New session spawner** — start a new Pi session in any directory via sidebar
 - iOS Japanese flick input fully supported
 
 ## How It Works
@@ -79,6 +81,7 @@ HTTP long-polling (no WebSocket dependency, works on all browsers):
 - `POST /set-model` — switch the active model
 - `GET /sessions` — list all active remote-control sessions
 - `POST /confirm/respond` — respond to a confirmation dialog (`{ confirmId, confirmed: boolean }`)
+- `POST /spawn-session` — spawn a new Pi session in a specified directory (`{ cwd: string }`)
 
 ### Tailscale Integration
 
@@ -93,6 +96,15 @@ HTTP long-polling (no WebSocket dependency, works on all browsers):
 - Session registry at `~/.pi/remote-control/sessions.json` enables cross-process discovery
 - Dead processes are automatically cleaned up via PID checks
 - Web UI session switcher redirects to other sessions' URLs
+
+### Session Spawning
+
+- Tap the **➕ New Session** button in the sidebar to spawn a new Pi process
+- Enter the target working directory (e.g. `/Users/me/project`)
+- A new `pi --mode rpc` child process starts with the remote-control extension loaded
+- The new session automatically registers in `sessions.json` and gets its own HTTP server
+- Web UI redirects to the new session after it's ready
+- Spawned sessions are cleaned up when the parent process exits
 
 ### iOS Safari Compatibility
 

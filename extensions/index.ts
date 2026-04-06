@@ -23,7 +23,7 @@ import net from "node:net";
 import crypto from "node:crypto";
 import path from "node:path";
 import fsSync from "node:fs";
-import { execSync } from "node:child_process";
+import { execSync, spawn, type ChildProcess } from "node:child_process";
 import os from "node:os";
 
 // ─── 型定義 ────────────────────────────────────────────────────
@@ -112,6 +112,87 @@ function cancelWebConfirm(confirmed: boolean, confirmId?: string): void {
 
 const occupiedPorts = new Set<number>();
 const sessionServers = new Map<string, ServerInstance>();
+
+// ─── 子プロセス管理（スポーンされたセッション） ─────────────────
+
+interface SpawnedSession {
+  proc: ChildProcess;
+  cwd: string;
+  startedAt: number;
+}
+
+const spawnedSessions = new Map<number, SpawnedSession>(); // pid → info
+
+/** 指定 cwd で pi --mode rpc を子プロセスとして起動 */
+function spawnPiSession(cwd: string): { pid: number } {
+  // pi の実行パスを検索
+  const piPath = findPiBinary();
+
+  const child = spawn(piPath, ["--mode", "rpc"], {
+    cwd,
+    stdio: ["pipe", "ignore", "ignore"],
+    detached: false,
+    env: { ...process.env },
+  });
+
+  if (!child.pid) {
+    throw new Error("子プロセスの起動に失敗しました");
+  }
+
+  const pid = child.pid;
+  spawnedSessions.set(pid, { proc: child, cwd, startedAt: Date.now() });
+
+  child.on("exit", () => {
+    spawnedSessions.delete(pid);
+  });
+
+  // stdin を開いたままにして RPC モードを維持
+  // エラーを無視（プロセス終了後に書き込みエラーが出る場合がある）
+  child.stdin?.on("error", () => {});
+
+  return { pid };
+}
+
+/** pi バイナリのパスを検索 */
+function findPiBinary(): string {
+  try {
+    return execSync("which pi", {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "pi"; // PATH に頼る
+  }
+}
+
+/** sessions.json にスポーンしたセッションが登録されるのを待つ */
+async function waitForSpawnedSession(pid: number, timeoutMs: number = 15000): Promise<RegistryEntry | null> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    await new Promise(r => setTimeout(r, 500));
+    const entries = readRegistry();
+    const entry = entries.find(e => e.pid === pid);
+    if (entry) return entry;
+    // プロセスが既に死んでいたら諦める
+    try { process.kill(pid, 0); } catch { return null; }
+  }
+  return null;
+}
+
+/** 全スポーン済み子プロセスを終了 */
+function cleanupSpawnedSessions(): void {
+  for (const [pid, s] of spawnedSessions) {
+    try {
+      // stdin を閉じて RPC モードを終了させる
+      s.proc.stdin?.end();
+      // 少し待ってからkill
+      setTimeout(() => {
+        try { process.kill(pid, "SIGTERM"); } catch { /* already dead */ }
+      }, 1000);
+    } catch { /* ignore */ }
+  }
+  spawnedSessions.clear();
+}
 
 // ─── プロセス間共有セッションレジストリ（ファイルベース） ──────
 
@@ -363,6 +444,29 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 .sb-item-sub{font-size:11px;color:var(--dm);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--fm)}
 .sb-cur-dot{width:8px;height:8px;border-radius:50%;background:var(--ok);flex-shrink:0;box-shadow:0 0 6px var(--ok)}
 .sb-item-badge{font-size:10px;font-weight:600;color:var(--ac);background:rgba(124,58,237,.15);padding:3px 8px;border-radius:20px;border:1px solid rgba(124,58,237,.3);flex-shrink:0;white-space:nowrap}
+
+/* ── 新規セッション ────────────────────────── */
+.sb-new-btn{display:flex;align-items:center;gap:10px;padding:14px 16px;cursor:pointer;border-radius:10px;margin:8px 8px 2px;border:1px dashed var(--bd);color:var(--ac);font-size:13px;font-weight:600;transition:background .15s}
+.sb-new-btn:active{background:rgba(124,58,237,.1)}
+.sb-new-icon{font-size:20px;width:32px;text-align:center;flex-shrink:0}
+.spawn-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:200;align-items:center;justify-content:center;padding:20px}
+.spawn-overlay.show{display:flex}
+.spawn-modal{background:var(--sf);border:1px solid var(--bd);border-radius:16px;width:100%;max-width:480px;box-shadow:0 16px 48px rgba(0,0,0,.5);animation:confirmIn .2s ease-out}
+.spawn-header{padding:16px 16px 12px;border-bottom:1px solid var(--bd)}
+.spawn-header h3{font-size:16px;color:var(--ac);margin:0}
+.spawn-body{padding:16px}
+.spawn-body input{width:100%;padding:10px 14px;border-radius:10px;border:1px solid var(--bd);background:var(--bg);color:var(--tx);font-size:14px;font-family:var(--fm);outline:none;box-sizing:border-box}
+.spawn-body input:focus{border-color:var(--ac)}
+.spawn-body input::placeholder{color:var(--dm)}
+.spawn-body .spawn-hint{font-size:11px;color:var(--dm);margin-top:8px;line-height:1.4}
+.spawn-body .spawn-error{font-size:12px;color:var(--er);margin-top:8px;display:none}
+.spawn-footer{padding:12px 16px 20px;border-top:1px solid var(--bd);display:flex;gap:12px;justify-content:flex-end}
+.spawn-footer button{padding:10px 24px;border-radius:10px;border:none;font-size:14px;font-weight:600;cursor:pointer;font-family:var(--fn);transition:opacity .15s}
+.spawn-footer button:active{transform:scale(.96)}
+.spawn-footer .btn-cancel{background:var(--bd);color:var(--tx)}
+.spawn-footer .btn-spawn{background:var(--ac);color:#fff}
+.spawn-footer .btn-spawn:disabled{opacity:.5;cursor:not-allowed}
+.spawn-loading{display:none;padding:16px;text-align:center;color:var(--dm);font-size:13px}
 </style>
 </head>
 <body>
@@ -372,7 +476,28 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 <nav id="sidebar" class="sidebar">
   <div class="sb-header">Sessions</div>
   <div id="sbList" class="sb-list"></div>
+  <div class="sb-new-btn" onclick="openSpawnDialog()">
+    <div class="sb-new-icon">➕</div>
+    <div>New Session</div>
+  </div>
 </nav>
+
+<!-- 新規セッション起動ダイアログ -->
+<div id="spawnOverlay" class="spawn-overlay" onclick="closeSpawnDialog()">
+  <div class="spawn-modal" onclick="event.stopPropagation()">
+    <div class="spawn-header"><h3>🚀 新規セッション</h3></div>
+    <div id="spawnForm" class="spawn-body">
+      <input id="spawnCwd" type="text" placeholder="/path/to/project" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+      <div class="spawn-hint">作業ディレクトリを入力してください。新しい Pi プロセスが起動します。</div>
+      <div id="spawnError" class="spawn-error"></div>
+    </div>
+    <div id="spawnLoading" class="spawn-loading">⚙️ セッションを起動中...</div>
+    <div class="spawn-footer">
+      <button class="btn-cancel" onclick="closeSpawnDialog()">Cancel</button>
+      <button id="spawnBtn" class="btn-spawn" onclick="doSpawnSession()">Start</button>
+    </div>
+  </div>
+</div>
 
 <div class="hd">
   <button id="hamburger" onclick="toggleSidebar()" aria-label="メニュー">
@@ -467,6 +592,62 @@ async function loadSidebarSessions(){
     }
   }catch(e){
     $('sbList').innerHTML='<div style="padding:20px;color:var(--er);font-size:13px;text-align:center">読み込み失敗</div>';
+  }
+}
+
+// ── 新規セッション起動 ────────────────────
+function openSpawnDialog(){
+  closeSidebar();
+  $('spawnCwd').value='';
+  $('spawnError').style.display='none';
+  $('spawnError').textContent='';
+  $('spawnForm').style.display='';
+  $('spawnLoading').style.display='none';
+  $('spawnBtn').disabled=false;
+  $('spawnOverlay').classList.add('show');
+  setTimeout(()=>{
+    const el=$('spawnCwd');
+    el.focus();
+    el.onkeydown=e=>{ if(e.key==='Enter'){e.preventDefault();doSpawnSession();} };
+  },100);
+}
+function closeSpawnDialog(){
+  $('spawnOverlay').classList.remove('show');
+}
+async function doSpawnSession(){
+  const cwd=$('spawnCwd').value.trim();
+  if(!cwd) return;
+  $('spawnBtn').disabled=true;
+  $('spawnError').style.display='none';
+  $('spawnForm').style.display='none';
+  $('spawnLoading').style.display='block';
+  try{
+    const r=await fetch(api('/spawn-session'),{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({cwd}),
+    });
+    const d=await r.json();
+    if(d.ok && d.session){
+      addM('s','🚀 新セッション起動: '+d.session.sessionId);
+      closeSpawnDialog();
+      // 新セッションにリダイレクト
+      setTimeout(()=>{
+        window.location.href=d.session.directUrl||d.session.url;
+      },500);
+    } else {
+      $('spawnForm').style.display='';
+      $('spawnLoading').style.display='none';
+      $('spawnBtn').disabled=false;
+      $('spawnError').textContent=d.error||'起動に失敗しました';
+      $('spawnError').style.display='block';
+    }
+  }catch(e){
+    $('spawnForm').style.display='';
+    $('spawnLoading').style.display='none';
+    $('spawnBtn').disabled=false;
+    $('spawnError').textContent='通信エラー';
+    $('spawnError').style.display='block';
   }
 }
 
@@ -923,6 +1104,41 @@ async function startServer(
       return;
     }
 
+    // 新しいセッションをスポーン
+    if (req.method === "POST" && pathname === "/spawn-session") {
+      const body = await readBody(req);
+      try {
+        const { cwd: targetCwd } = JSON.parse(body);
+        if (!targetCwd || typeof targetCwd !== "string") {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "cwd は必須です" }));
+          return;
+        }
+        // ディレクトリの存在チェック
+        if (!fsSync.existsSync(targetCwd) || !fsSync.statSync(targetCwd).isDirectory()) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "ディレクトリが存在しません: " + targetCwd }));
+          return;
+        }
+        ctx.ui.notify(`📱 新セッション起動: ${targetCwd}`, "info");
+        const { pid } = spawnPiSession(targetCwd);
+        // sessions.json に登録されるのを待つ
+        const entry = await waitForSpawnedSession(pid);
+        if (entry) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, session: entry }));
+          ctx.ui.notify(`📱 新セッション起動完了: ${entry.sessionId} (pid=${pid})`, "success");
+        } else {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "セッション起動がタイムアウトしました" }));
+        }
+      } catch (e: unknown) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "起動失敗" }));
+      }
+      return;
+    }
+
     // モデル一覧取得
     if (pathname === "/models") {
       const available = ctx.modelRegistry.getAvailable();
@@ -1115,6 +1331,8 @@ export default function (pi: ExtensionAPI) {
     if (isServerRunning) stopServer(sessionId);
     serverPort = null;
     isServerRunning = false;
+    // スポーンした子プロセスを全て終了
+    cleanupSpawnedSessions();
     // shutdown時にグローバル参照をクリア
     delete (globalThis as any).__remoteConfirm;
     delete (globalThis as any).__remoteRespond;
