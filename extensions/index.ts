@@ -26,8 +26,6 @@ import fsSync from "node:fs";
 import { execSync, spawn, type ChildProcess } from "node:child_process";
 import os from "node:os";
 
-// ─── 型定義 ────────────────────────────────────────────────────
-
 type Evt = { id: number; type: string; [k: string]: unknown };
 
 interface WaitingClient {
@@ -46,8 +44,6 @@ interface ServerInstance {
   nextEventId: number;
 }
 
-// ─── 確認ダイアログ管理 ────────────────────────────────────────
-
 interface PendingConfirm {
   id: string;
   title: string;
@@ -58,7 +54,6 @@ interface PendingConfirm {
 
 const pendingConfirms = new Map<string, PendingConfirm>();
 
-/** 拡張機能が確認ダイアログを要求 → Web UIに配信し、応答を待つ */
 function requestWebConfirm(title: string, message: string, timeoutSeconds: number = 60): Promise<boolean> {
   const id = `confirm_${crypto.randomUUID().slice(0, 8)}`;
   return new Promise<boolean>((resolve) => {
@@ -80,7 +75,6 @@ function requestWebConfirm(title: string, message: string, timeoutSeconds: numbe
   });
 }
 
-/** Web UIから確認レスポンスを受信 → 待機中のPromiseを解決 */
 function respondWebConfirm(confirmId: string, confirmed: boolean): void {
   const pending = pendingConfirms.get(confirmId);
   if (pending) {
@@ -108,12 +102,8 @@ function cancelWebConfirm(confirmed: boolean, confirmId?: string): void {
   }
 }
 
-// ─── プロセス内状態 ────────────────────────────────────────────
-
 const occupiedPorts = new Set<number>();
 const sessionServers = new Map<string, ServerInstance>();
-
-// ─── 子プロセス管理（スポーンされたセッション） ─────────────────
 
 interface SpawnedSession {
   proc: ChildProcess;
@@ -160,7 +150,6 @@ function spawnPiSession(cwd: string): { pid: number } {
   return { pid };
 }
 
-/** pi バイナリのパスを検索 */
 function findPiBinary(): string {
   try {
     return execSync("which pi", {
@@ -168,7 +157,7 @@ function findPiBinary(): string {
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
   } catch {
-    return "pi"; // PATH に頼る
+    return "pi";
   }
 }
 
@@ -185,7 +174,6 @@ async function waitForSpawnedSession(knownPids: Set<number>, timeoutMs: number =
   return null;
 }
 
-/** ~ をホームディレクトリに展開 */
 function expandTilde(p: string): string {
   if (p === "~") return os.homedir();
   if (p.startsWith("~/")) return path.join(os.homedir(), p.slice(2));
@@ -213,18 +201,16 @@ function getRecentProjectDirs(): string[] {
         ).split("\n")[0];
         const header = JSON.parse(firstLine);
         if (header.cwd && typeof header.cwd === "string") {
-          // ディレクトリが存在するもののみ
           if (fsSync.existsSync(header.cwd)) {
             dirs.add(header.cwd);
           }
         }
-      } catch { /* 壊れたファイルは無視 */ }
+      } catch {}
     }
-  } catch { /* sessionsディレクトリがない */ }
+  } catch {}
   return [...dirs].sort();
 }
 
-/** ディレクトリの中身を一覧で返す（ディレクトリのみ） */
 function listSubdirectories(dirPath: string): { name: string; path: string }[] {
   try {
     const resolved = path.resolve(expandTilde(dirPath));
@@ -237,7 +223,6 @@ function listSubdirectories(dirPath: string): { name: string; path: string }[] {
   }
 }
 
-/** 全スポーン済み子プロセスを終了 */
 function cleanupSpawnedSessions(): void {
   for (const [pid, s] of spawnedSessions) {
     killSpawnedSession(pid);
@@ -253,7 +238,7 @@ function killSpawnedSession(pid: number): boolean {
       // sh + tail + pi のプロセスツリーごと終了（負の PID でプロセスグループに SIGTERM）
       process.kill(-pid, "SIGTERM");
     } catch {
-      try { process.kill(pid, "SIGTERM"); } catch { /* already dead */ }
+      try { process.kill(pid, "SIGTERM"); } catch {}
     }
     spawnedSessions.delete(pid);
     return true;
@@ -266,8 +251,6 @@ function killSpawnedSession(pid: number): boolean {
     return false;
   }
 }
-
-// ─── プロセス間共有セッションレジストリ（ファイルベース） ──────
 
 const REGISTRY_PATH = path.join(os.homedir(), ".pi", "remote-control", "sessions.json");
 
@@ -293,7 +276,7 @@ function writeRegistry(entries: RegistryEntry[]): void {
   try {
     fsSync.mkdirSync(path.dirname(REGISTRY_PATH), { recursive: true });
     fsSync.writeFileSync(REGISTRY_PATH, JSON.stringify(entries, null, 2));
-  } catch { /* ignore */ }
+  } catch {}
 }
 
 function registerSession(entry: RegistryEntry): void {
@@ -306,9 +289,6 @@ function unregisterSession(sessionId: string): void {
   writeRegistry(readRegistry().filter(e => e.sessionId !== sessionId));
 }
 
-// ─── ユーティリティ ────────────────────────────────────────────
-
-/** AgentMessage から テキスト部分を抽出 */
 function extractText(message: any): string {
   if (!message?.content) return "";
   return message.content
@@ -334,7 +314,6 @@ function pushEvent(sessionId: string, event: Omit<Evt, "id">): void {
   }
 }
 
-/** HTTP リクエストボディを読み取る */
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve) => {
     let body = "";
@@ -342,8 +321,6 @@ function readBody(req: http.IncomingMessage): Promise<string> {
     req.on("end", () => resolve(body));
   });
 }
-
-// ─── Tailscale ─────────────────────────────────────────────────
 
 /** Tailscale の FQDN を取得（HTTPS 証明書用） */
 function getTailscaleFQDN(): string {
@@ -359,7 +336,6 @@ function getTailscaleFQDN(): string {
   }
 }
 
-/** Tailscale の IPv4 アドレスを取得（フォールバック） */
 function getTailscaleIP(): string {
   try {
     return execSync("tailscale ip -4 2>/dev/null", {
@@ -396,7 +372,7 @@ function teardownTailscaleServe(): void {
   if (isSpawnedChild) return; // 子プロセスは親の設定を削除しない
   try {
     execSync(`tailscale serve --set-path ${SERVE_PATH} off`, { stdio: "ignore" });
-  } catch { /* ignore */ }
+  } catch {}
 }
 
 /** 親プロセスの生存監視を開始。親が死んだら tailscale serve を引き継ぐ */
@@ -427,8 +403,6 @@ function buildRemoteUrl(port: number, fqdn: string, useTailscaleServe: boolean):
   return `http://${getTailscaleIP()}:${port}`;
 }
 
-// ─── ポート検索 ────────────────────────────────────────────────
-
 async function findAvailablePort(start: number): Promise<number> {
   for (let i = 0; i < 50; i++) {
     const candidate = start + i;
@@ -440,12 +414,10 @@ async function findAvailablePort(start: number): Promise<number> {
         srv.listen(candidate, "0.0.0.0", () => srv.close(() => resolve()));
       });
       return candidate;
-    } catch { /* 使用中 */ }
+    } catch {}
   }
   throw new Error(`ポート ${start}〜 が全て使用中です`);
 }
-
-// ─── Web UI HTML ───────────────────────────────────────────────
 
 function generateHTML(): string {
   return `<!DOCTYPE html>
@@ -498,7 +470,6 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 .modal-item .mi-check{width:20px;flex-shrink:0;text-align:center}
 .modal-item .mi-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .modal-item .mi-prov{font-size:11px;color:var(--dm);flex-shrink:0}
-/* ── 確認ダイアログ ───────────────────────── */
 .confirm-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:200;align-items:center;justify-content:center;padding:20px}
 .confirm-overlay.show{display:flex}
 .confirm-modal{background:var(--sf);border:1px solid var(--bd);border-radius:16px;width:100%;max-width:480px;box-shadow:0 16px 48px rgba(0,0,0,.5);animation:confirmIn .2s ease-out}
@@ -515,7 +486,6 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 .btn-yes:hover{opacity:.85}
 .confirm-timer{padding:0 16px 8px;font-size:12px;color:var(--dm);text-align:center}
 
-/* ── ハンバーガーボタン ────────────────────── */
 #hamburger{width:36px;height:36px;border-radius:8px;border:none;background:transparent;cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;padding:0;flex-shrink:0;-webkit-tap-highlight-color:transparent}
 #hamburger span{display:block;width:20px;height:2px;background:var(--tx);border-radius:2px;transition:transform .3s ease,opacity .3s ease,top .3s ease}
 #hamburger:active{background:var(--bd)}
@@ -523,18 +493,15 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 #hamburger.open span:nth-child(2){opacity:0;transform:scaleX(0)}
 #hamburger.open span:nth-child(3){transform:translateY(-7px) rotate(-45deg)}
 
-/* ── サイドバー backdrop ─────────────────── */
 .sb-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:50;backdrop-filter:blur(2px);-webkit-backdrop-filter:blur(2px);transition:opacity .3s}
 .sb-backdrop.open{display:block;animation:bdIn .25s ease forwards}
 @keyframes bdIn{from{opacity:0}to{opacity:1}}
 
-/* ── サイドバー本体 ──────────────────────── */
 .sidebar{position:fixed;top:0;left:0;bottom:0;width:min(280px,85vw);background:var(--sf);border-right:1px solid var(--bd);z-index:60;display:flex;flex-direction:column;transform:translateX(-100%);transition:transform .3s cubic-bezier(.4,0,.2,1);box-shadow:none;padding-top:env(safe-area-inset-top,0px)}
 .sidebar.open{transform:translateX(0);box-shadow:4px 0 32px rgba(0,0,0,.4)}
 .sb-header{padding:20px 16px 14px;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--dm);border-bottom:1px solid var(--bd);flex-shrink:0}
 .sb-list{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:8px 0}
 
-/* ── セッションアイテム ───────────────────── */
 .sb-item{display:flex;align-items:center;gap:12px;padding:12px 16px;cursor:pointer;border-radius:10px;margin:2px 8px;transition:background .15s;-webkit-tap-highlight-color:transparent}
 .sb-item:active{background:var(--bg)}
 .sb-item.active{background:rgba(124,58,237,.12)}
@@ -547,7 +514,6 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 .sb-item-close{width:28px;height:28px;border-radius:50%;border:none;background:transparent;color:var(--dm);font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;-webkit-tap-highlight-color:transparent;transition:background .15s,color .15s}
 .sb-item-close:active{background:rgba(239,68,68,.15);color:var(--er)}
 
-/* ── 新規セッション ────────────────────────── */
 .sb-new-btn{display:flex;align-items:center;gap:10px;padding:14px 16px;cursor:pointer;border-radius:10px;margin:8px 8px 2px;border:1px dashed var(--bd);color:var(--ac);font-size:13px;font-weight:600;transition:background .15s}
 .sb-new-btn:active{background:rgba(124,58,237,.1)}
 .sb-new-icon{font-size:20px;width:32px;text-align:center;flex-shrink:0}
@@ -671,7 +637,6 @@ let lastId=0, processing=false, streamEl=null, sentLocally=false;
 let currentConfirmId=null, confirmTimerEl=null;
 let currentSessionId='';
 
-// ── サイドバー ────────────────────────────
 function toggleSidebar(){
   const sb=$('sidebar'), bd=$('sbBackdrop'), hb=$('hamburger');
   const opening=!sb.classList.contains('open');
@@ -713,7 +678,6 @@ async function loadSidebarSessions(){
         closeSidebar();
         if(!isCur) window.location.href=s.directUrl||s.url;
       };
-      // 現在のセッション以外に閉じるボタンを追加
       if(!isCur){
         const closeBtn=document.createElement('button');
         closeBtn.className='sb-item-close';
@@ -732,7 +696,6 @@ async function loadSidebarSessions(){
   }
 }
 
-// ── セッション終了 ──────────────────────
 function confirmKillSession(sessionId, pid, dirName){
   if(!confirm('セッションを終了しますか？\\n'+dirName+' ('+sessionId+')')) return;
   killSession(pid);
@@ -757,7 +720,6 @@ async function killSession(pid){
   }
 }
 
-// ── 新規セッション起動 ────────────────────
 let spawnSelectedCwd='';
 let spawnCurrentTab='recent';
 
@@ -822,11 +784,9 @@ async function browseTo(dirPath){
   try{
     const r=await fetch(api('/browse?path='+encodeURIComponent(dirPath)));
     const d=await r.json();
-    // パスバーを更新
     renderPathBar(d.current);
     selectCwd(d.current);
     list.innerHTML='';
-    // 親ディレクトリ
     if(d.parent){
       const up=document.createElement('div');
       up.className='spawn-dir-item';
@@ -856,7 +816,6 @@ function renderPathBar(fullPath){
   bar.innerHTML='';
   const parts=fullPath.split('/').filter(Boolean);
   let accumulated='/';
-  // ルート
   const root=document.createElement('span');
   root.className='sp-seg';
   root.textContent='/';
@@ -939,13 +898,11 @@ function setProcessing(v){
   }
 }
 
-// ── 確認ダイアログ ────────────────────────
 function showConfirm(confirmId, title, message, timeoutSec) {
   currentConfirmId = confirmId;
   $("confirmTitle").textContent = title;
   $("confirmBody").textContent = message;
   $("confirmOverlay").classList.add("show");
-  // タイマー表示
   if (timeoutSec > 0) {
     let remaining = timeoutSec;
     $("confirmTimer").textContent = remaining + "秒後に自動拒否";
@@ -1064,8 +1021,6 @@ function handleEvents(events){
   }
 }
 
-// ── 通信 ──────────────────────────────────────────────
-
 async function init(){
   try{
     const r=await fetch(api("/poll?since=0"));
@@ -1122,8 +1077,6 @@ async function interrupt(){
   addM("s","⛔ 中断要求送信");
 }
 
-// ── UI イベント ───────────────────────────────────────
-
 sndBtn.onclick=send;
 stpBtn.onclick=interrupt;
 
@@ -1132,7 +1085,6 @@ function updateSessionLabel(sid){
   $('hdTitle').textContent='Pi · '+sid;
 }
 
-// ── モデル選択 ─────────────────────────────────
 const mdlBtn=$('mdl'), modelOverlay=$('modelOverlay'), modelList=$('modelList');
 let currentModelId='', models=[];
 
@@ -1232,8 +1184,6 @@ init();
 </html>`;
 }
 
-// ─── サーバー起動・停止 ────────────────────────────────────────
-
 async function startServer(
   sessionId: string,
   workingDir: string,
@@ -1274,7 +1224,7 @@ async function startServer(
         pushEvent(sessionId, { type: "response:done", text });
       }
     }
-  } catch { /* セッション履歴がない場合は無視 */ }
+  } catch {}
 
   httpServer.on("request", async (req: http.IncomingMessage, res: http.ServerResponse) => {
     const reqUrl = new URL(req.url || "/", `http://${req.headers.host}`);
@@ -1333,7 +1283,7 @@ async function startServer(
           ctx.ui.notify(`📱 プロンプト受信: ${text.slice(0, 80)}`, "info");
           piApi.sendUserMessage(text);
         }
-      } catch { /* invalid JSON */ }
+      } catch {}
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end('{"ok":true}');
       return;
@@ -1360,7 +1310,6 @@ async function startServer(
       return;
     }
 
-    // 全アクティブセッション一覧
     if (pathname === "/sessions") {
       const sessions = readRegistry();
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -1368,7 +1317,6 @@ async function startServer(
       return;
     }
 
-    // セッションを終了
     if (req.method === "POST" && pathname === "/kill-session") {
       const body = await readBody(req);
       try {
@@ -1402,7 +1350,6 @@ async function startServer(
       return;
     }
 
-    // 最近のプロジェクトディレクトリ一覧
     if (pathname === "/recent-dirs") {
       const dirs = getRecentProjectDirs();
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -1410,7 +1357,6 @@ async function startServer(
       return;
     }
 
-    // ディレクトリブラウザ
     if (pathname === "/browse") {
       const dirParam = reqUrl.searchParams.get("path") || os.homedir();
       const resolved = path.resolve(expandTilde(dirParam));
@@ -1421,7 +1367,6 @@ async function startServer(
       return;
     }
 
-    // 新しいセッションをスポーン
     if (req.method === "POST" && pathname === "/spawn-session") {
       const body = await readBody(req);
       try {
@@ -1431,10 +1376,8 @@ async function startServer(
           res.end(JSON.stringify({ ok: false, error: "cwd は必須です" }));
           return;
         }
-        // ~ 展開
-        targetCwd = path.resolve(expandTilde(targetCwd));
-        // ディレクトリの存在チェック
-        if (!fsSync.existsSync(targetCwd) || !fsSync.statSync(targetCwd).isDirectory()) {
+    targetCwd = path.resolve(expandTilde(targetCwd));
+    if (!fsSync.existsSync(targetCwd) || !fsSync.statSync(targetCwd).isDirectory()) {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: false, error: "ディレクトリが存在しません: " + targetCwd }));
           return;
@@ -1460,7 +1403,6 @@ async function startServer(
       return;
     }
 
-    // モデル一覧取得
     if (pathname === "/models") {
       const available = ctx.modelRegistry.getAvailable();
       const current = ctx.model;
@@ -1476,7 +1418,6 @@ async function startServer(
       return;
     }
 
-    // モデル切り替え
     if (req.method === "POST" && pathname === "/set-model") {
       const body = await readBody(req);
       try {
@@ -1501,7 +1442,6 @@ async function startServer(
       return;
     }
 
-    // 中断要求
     if (req.method === "POST" && pathname === "/interrupt") {
       ctx.ui.notify("🛑 リモート中断要求", "warning");
       pushEvent(sessionId, { type: "agent:interrupted" });
@@ -1510,7 +1450,6 @@ async function startServer(
       return;
     }
 
-    // Web UI
     res.writeHead(200, {
       "Content-Type": "text/html; charset=UTF-8",
       "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -1557,8 +1496,6 @@ function stopServer(sessionId: string): void {
   unregisterSession(sessionId);
   teardownTailscaleServe();
 }
-
-// ─── 拡張機能エントリーポイント ────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
   let serverPort: number | null = null;
@@ -1618,7 +1555,6 @@ export default function (pi: ExtensionAPI) {
     pushEvent(sessionId, { type: "response:update", text });
   });
 
-  // メッセージ完了時に最終テキストを送信
   pi.on("message_end", async (event: any) => {
     if (!isServerRunning) return;
     if (event.message?.role !== "assistant") return;
@@ -1626,7 +1562,6 @@ export default function (pi: ExtensionAPI) {
     pushEvent(sessionId, { type: "response:done", text });
   });
 
-  // モデル変更をWeb UIに通知
   pi.on("model_select", async (event: any) => {
     if (!isServerRunning) return;
     const m = event.model;
@@ -1655,8 +1590,7 @@ export default function (pi: ExtensionAPI) {
     if (isServerRunning) stopServer(sessionId);
     serverPort = null;
     isServerRunning = false;
-    // スポーンした子プロセスを全て終了
-    cleanupSpawnedSessions();
+  cleanupSpawnedSessions();
     // shutdown時にグローバル参照をクリア
     delete (globalThis as any).__remoteConfirm;
     delete (globalThis as any).__remoteRespond;
