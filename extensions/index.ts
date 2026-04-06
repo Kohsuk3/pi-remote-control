@@ -705,7 +705,7 @@ async function loadSidebarSessions(){
 
 // ── セッション終了 ──────────────────────
 function confirmKillSession(sessionId, pid, dirName){
-  if(!confirm('セッションを終了しますか？\n'+dirName+' ('+sessionId+')')) return;
+  if(!confirm('セッションを終了しますか？\\n'+dirName+' ('+sessionId+')')) return;
   killSession(pid);
 }
 async function killSession(pid){
