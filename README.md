@@ -82,6 +82,8 @@ HTTP long-polling (no WebSocket dependency, works on all browsers):
 - `GET /sessions` — list all active remote-control sessions
 - `POST /confirm/respond` — respond to a confirmation dialog (`{ confirmId, confirmed: boolean }`)
 - `POST /spawn-session` — spawn a new Pi session in a specified directory (`{ cwd: string }`)
+- `GET /recent-dirs` — list recent project directories from Pi session history
+- `GET /browse?path=` — list subdirectories for the directory browser
 
 ### Tailscale Integration
 
@@ -99,8 +101,10 @@ HTTP long-polling (no WebSocket dependency, works on all browsers):
 
 ### Session Spawning
 
-- Tap the **➕ New Session** button in the sidebar to spawn a new Pi process
-- Enter the target working directory (e.g. `/Users/me/project`)
+- Tap the **➕ New Session** button in the sidebar to open the session spawner
+- **Recent tab**: Shows recent project directories from Pi session history — tap to start instantly
+- **Browse tab**: Navigate the filesystem with a directory browser — tap folders to drill down, use path bar to jump
+- `~` is automatically expanded to the home directory (works on macOS and Linux)
 - A new `pi --mode rpc` child process starts with the remote-control extension loaded
 - The new session automatically registers in `sessions.json` and gets its own HTTP server
 - Web UI redirects to the new session after it's ready
