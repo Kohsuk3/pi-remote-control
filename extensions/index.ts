@@ -123,19 +123,26 @@ interface SpawnedSession {
 
 const spawnedSessions = new Map<number, SpawnedSession>(); // pid → info
 
-/** 指定 cwd で pi --mode rpc を子プロセスとして起動 */
+/** 指定 cwd で pi --mode rpc を子プロセスとして起動
+ *  親プロセスが死んでも子が生き残るように:
+ *  - detached: true で独立プロセスグループ
+ *  - tail -f /dev/null 経由で stdin を永続化（親の pipe が壊れても EOF にならない）
+ */
 function spawnPiSession(cwd: string): { pid: number } {
-  // pi の実行パスを検索
   const piPath = findPiBinary();
 
-  const child = spawn(piPath, ["--mode", "rpc"], {
+  // nohup sh -c 'tail -f /dev/null | pi --mode rpc' で起動
+  // nohup: SIGHUP を無視して親終了時も生き残る
+  // tail -f /dev/null: stdin を開き続ける（親の pipe が壊れても EOF にならない）
+  // stdout/stderr を /dev/null にして pipe 依存を完全に断つ
+  const child = spawn("sh", ["-c", `trap '' HUP; tail -f /dev/null | exec ${piPath} --mode rpc > /dev/null 2>&1`], {
     cwd,
-    // stdin: pipe で開いたまま保持し RPC モードを維持
-    // stdout/stderr: pipe で受け取る（ignore だと書き込みエラーでプロセスが終了する）
-    stdio: ["pipe", "pipe", "pipe"],
-    detached: false,
-    env: { ...process.env, PI_REMOTE_SPAWNED: "1" },
+    stdio: ["ignore", "ignore", "ignore"],
+    detached: true,
+    env: { ...process.env, PI_REMOTE_SPAWNED: "1", PI_REMOTE_PARENT_PID: String(process.pid) },
   });
+
+  child.unref();
 
   if (!child.pid) {
     throw new Error("子プロセスの起動に失敗しました");
@@ -148,11 +155,7 @@ function spawnPiSession(cwd: string): { pid: number } {
     spawnedSessions.delete(pid);
   });
 
-  // stdin を開いたままにして RPC モードを維持
-  child.stdin?.on("error", () => {});
-  // stdout/stderr を drain してバッファ溢れを防止
-  child.stdout?.resume();
-  child.stderr?.resume();
+
 
   return { pid };
 }
@@ -169,16 +172,15 @@ function findPiBinary(): string {
   }
 }
 
-/** sessions.json にスポーンしたセッションが登録されるのを待つ */
-async function waitForSpawnedSession(pid: number, timeoutMs: number = 15000): Promise<RegistryEntry | null> {
+/** sessions.json にスポーンしたセッションが登録されるのを待つ
+ *  sh 経由で起動するため PID が変わるので、起動前のレジストリとの差分で検出 */
+async function waitForSpawnedSession(knownPids: Set<number>, timeoutMs: number = 15000): Promise<RegistryEntry | null> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     await new Promise(r => setTimeout(r, 500));
     const entries = readRegistry();
-    const entry = entries.find(e => e.pid === pid);
-    if (entry) return entry;
-    // プロセスが既に死んでいたら諦める
-    try { process.kill(pid, 0); } catch { return null; }
+    const newEntry = entries.find(e => !knownPids.has(e.pid));
+    if (newEntry) return newEntry;
   }
   return null;
 }
@@ -248,11 +250,11 @@ function killSpawnedSession(pid: number): boolean {
   const s = spawnedSessions.get(pid);
   if (s) {
     try {
-      s.proc.stdin?.end();
-      setTimeout(() => {
-        try { process.kill(pid, "SIGTERM"); } catch { /* already dead */ }
-      }, 1000);
-    } catch { /* ignore */ }
+      // sh + tail + pi のプロセスツリーごと終了（負の PID でプロセスグループに SIGTERM）
+      process.kill(-pid, "SIGTERM");
+    } catch {
+      try { process.kill(pid, "SIGTERM"); } catch { /* already dead */ }
+    }
     spawnedSessions.delete(pid);
     return true;
   }
@@ -372,7 +374,9 @@ function getTailscaleIP(): string {
 const SERVE_PATH = "/remote";
 
 /** スポーンされた子プロセスかどうか（子は tailscale serve を触らない） */
-const isSpawnedChild = process.env.PI_REMOTE_SPAWNED === "1";
+let isSpawnedChild = process.env.PI_REMOTE_SPAWNED === "1";
+const parentPid = process.env.PI_REMOTE_PARENT_PID ? parseInt(process.env.PI_REMOTE_PARENT_PID, 10) : null;
+let parentWatchTimer: ReturnType<typeof setInterval> | null = null;
 
 /** tailscale serve でパスベースのプロキシを設定（TLS終端はtailscaleが担当） */
 function setupTailscaleServe(port: number): boolean {
@@ -393,6 +397,26 @@ function teardownTailscaleServe(): void {
   try {
     execSync(`tailscale serve --set-path ${SERVE_PATH} off`, { stdio: "ignore" });
   } catch { /* ignore */ }
+}
+
+/** 親プロセスの生存監視を開始。親が死んだら tailscale serve を引き継ぐ */
+function startParentWatcher(ownPort: number): void {
+  if (!isSpawnedChild || !parentPid) return;
+  parentWatchTimer = setInterval(() => {
+    try {
+      process.kill(parentPid, 0); // 生存確認（シグナルは送らない）
+    } catch {
+      // 親が死んだ → tailscale serve を引き継ぐ
+      isSpawnedChild = false;
+      if (parentWatchTimer) { clearInterval(parentWatchTimer); parentWatchTimer = null; }
+      const fqdn = getTailscaleFQDN();
+      if (fqdn) setupTailscaleServe(ownPort);
+    }
+  }, 5000);
+}
+
+function stopParentWatcher(): void {
+  if (parentWatchTimer) { clearInterval(parentWatchTimer); parentWatchTimer = null; }
 }
 
 /** リモートアクセス URL を生成 */
@@ -1416,13 +1440,15 @@ async function startServer(
           return;
         }
         ctx.ui.notify(`📱 新セッション起動: ${targetCwd}`, "info");
-        const { pid } = spawnPiSession(targetCwd);
-        // sessions.json に登録されるのを待つ
-        const entry = await waitForSpawnedSession(pid);
+        // 起動前のレジストリ PID を記録
+        const knownPids = new Set(readRegistry().map(e => e.pid));
+        const { pid: shPid } = spawnPiSession(targetCwd);
+        // sessions.json に新エントリが登録されるのを待つ
+        const entry = await waitForSpawnedSession(knownPids);
         if (entry) {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true, session: entry }));
-          ctx.ui.notify(`📱 新セッション起動完了: ${entry.sessionId} (pid=${pid})`, "success");
+          ctx.ui.notify(`📱 新セッション起動完了: ${entry.sessionId} (pid=${entry.pid})`, "success");
         } else {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: false, error: "セッション起動がタイムアウトしました" }));
@@ -1498,6 +1524,8 @@ async function startServer(
     ctx.ui.setStatus("remote-ctrl", ctx.ui.theme.fg("success", `📱 :${port}`));
     const directUrl = `http://${getTailscaleIP()}:${port}`;
     registerSession({ sessionId, port, url, directUrl, workingDir, pid: process.pid });
+    // 親プロセスの生存監視を開始（子プロセスのみ）
+    startParentWatcher(port);
     // 他の拡張（Python LSP 等）の session_start 通知が出終わった後に表示されるよう遅延
     setTimeout(() => {
       ctx.ui.notify([
@@ -1520,6 +1548,7 @@ async function startServer(
 function stopServer(sessionId: string): void {
   const s = sessionServers.get(sessionId);
   if (!s) return;
+  stopParentWatcher();
   pushEvent(sessionId, { type: "server:shutdown" });
   for (const wc of s.waitingClients.values()) clearTimeout(wc.timer);
   s.httpServer.close(() => {});
