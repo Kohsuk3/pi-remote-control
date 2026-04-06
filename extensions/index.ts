@@ -183,6 +183,58 @@ async function waitForSpawnedSession(pid: number, timeoutMs: number = 15000): Pr
   return null;
 }
 
+/** ~ をホームディレクトリに展開 */
+function expandTilde(p: string): string {
+  if (p === "~") return os.homedir();
+  if (p.startsWith("~/")) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+
+/** Pi セッション履歴からプロジェクトディレクトリ一覧を取得 */
+function getRecentProjectDirs(): string[] {
+  const sessionsDir = path.join(os.homedir(), ".pi", "agent", "sessions");
+  const dirs = new Set<string>();
+  try {
+    const subdirs = fsSync.readdirSync(sessionsDir, { withFileTypes: true })
+      .filter(d => d.isDirectory())
+      .map(d => d.name);
+    for (const subdir of subdirs) {
+      const files = fsSync.readdirSync(path.join(sessionsDir, subdir))
+        .filter(f => f.endsWith(".jsonl"))
+        .sort()
+        .reverse();
+      if (files.length === 0) continue;
+      // 最新セッションファイルの1行目から cwd を取得
+      try {
+        const firstLine = fsSync.readFileSync(
+          path.join(sessionsDir, subdir, files[0]), "utf-8"
+        ).split("\n")[0];
+        const header = JSON.parse(firstLine);
+        if (header.cwd && typeof header.cwd === "string") {
+          // ディレクトリが存在するもののみ
+          if (fsSync.existsSync(header.cwd)) {
+            dirs.add(header.cwd);
+          }
+        }
+      } catch { /* 壊れたファイルは無視 */ }
+    }
+  } catch { /* sessionsディレクトリがない */ }
+  return [...dirs].sort();
+}
+
+/** ディレクトリの中身を一覧で返す（ディレクトリのみ） */
+function listSubdirectories(dirPath: string): { name: string; path: string }[] {
+  try {
+    const resolved = path.resolve(expandTilde(dirPath));
+    return fsSync.readdirSync(resolved, { withFileTypes: true })
+      .filter(d => d.isDirectory() && !d.name.startsWith("."))
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map(d => ({ name: d.name, path: path.join(resolved, d.name) }));
+  } catch {
+    return [];
+  }
+}
+
 /** 全スポーン済み子プロセスを終了 */
 function cleanupSpawnedSessions(): void {
   for (const [pid, s] of spawnedSessions) {
@@ -458,19 +510,34 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 .spawn-modal{background:var(--sf);border:1px solid var(--bd);border-radius:16px;width:100%;max-width:480px;box-shadow:0 16px 48px rgba(0,0,0,.5);animation:confirmIn .2s ease-out}
 .spawn-header{padding:16px 16px 12px;border-bottom:1px solid var(--bd)}
 .spawn-header h3{font-size:16px;color:var(--ac);margin:0}
-.spawn-body{padding:16px}
-.spawn-body input{width:100%;padding:10px 14px;border-radius:10px;border:1px solid var(--bd);background:var(--bg);color:var(--tx);font-size:14px;font-family:var(--fm);outline:none;box-sizing:border-box}
-.spawn-body input:focus{border-color:var(--ac)}
-.spawn-body input::placeholder{color:var(--dm)}
-.spawn-body .spawn-hint{font-size:11px;color:var(--dm);margin-top:8px;line-height:1.4}
-.spawn-body .spawn-error{font-size:12px;color:var(--er);margin-top:8px;display:none}
-.spawn-footer{padding:12px 16px 20px;border-top:1px solid var(--bd);display:flex;gap:12px;justify-content:flex-end}
+.spawn-body{padding:0;max-height:55vh;overflow-y:auto;-webkit-overflow-scrolling:touch}
+.spawn-path-bar{display:flex;align-items:center;gap:4px;padding:10px 16px;background:var(--bg);border-bottom:1px solid var(--bd);font-family:var(--fm);font-size:12px;color:var(--dm);flex-wrap:wrap;position:sticky;top:0;z-index:1}
+.spawn-path-bar .sp-seg{color:var(--ac);cursor:pointer;padding:2px 4px;border-radius:4px}
+.spawn-path-bar .sp-seg:active{background:rgba(124,58,237,.15)}
+.spawn-path-bar .sp-sep{color:var(--bd);flex-shrink:0}
+.spawn-section{padding:8px 0}
+.spawn-section-title{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--dm);padding:6px 16px 4px}
+.spawn-dir-item{display:flex;align-items:center;gap:10px;padding:10px 16px;cursor:pointer;font-size:13px;color:var(--tx);transition:background .1s}
+.spawn-dir-item:active{background:var(--bg)}
+.spawn-dir-item .sdi-icon{font-size:16px;flex-shrink:0;width:24px;text-align:center}
+.spawn-dir-item .sdi-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.spawn-dir-item .sdi-arrow{color:var(--dm);font-size:14px;flex-shrink:0}
+.spawn-dir-item .sdi-action{font-size:10px;font-weight:600;color:var(--ok);background:rgba(16,185,129,.12);padding:3px 8px;border-radius:12px;border:1px solid rgba(16,185,129,.25);flex-shrink:0;white-space:nowrap}
+.spawn-dir-item.recent .sdi-icon{font-size:14px}
+.spawn-empty{padding:20px 16px;text-align:center;font-size:13px;color:var(--dm)}
+.spawn-error{font-size:12px;color:var(--er);padding:8px 16px;display:none}
+.spawn-footer{padding:12px 16px 20px;border-top:1px solid var(--bd);display:flex;gap:12px;justify-content:flex-end;align-items:center}
 .spawn-footer button{padding:10px 24px;border-radius:10px;border:none;font-size:14px;font-weight:600;cursor:pointer;font-family:var(--fn);transition:opacity .15s}
 .spawn-footer button:active{transform:scale(.96)}
 .spawn-footer .btn-cancel{background:var(--bd);color:var(--tx)}
 .spawn-footer .btn-spawn{background:var(--ac);color:#fff}
 .spawn-footer .btn-spawn:disabled{opacity:.5;cursor:not-allowed}
-.spawn-loading{display:none;padding:16px;text-align:center;color:var(--dm);font-size:13px}
+.spawn-footer .sf-path{flex:1;font-size:11px;color:var(--dm);font-family:var(--fm);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.spawn-loading{display:none;padding:20px 16px;text-align:center;color:var(--dm);font-size:13px}
+.spawn-tabs{display:flex;border-bottom:1px solid var(--bd);position:sticky;top:0;z-index:2;background:var(--sf)}
+.spawn-tab{flex:1;padding:10px;text-align:center;font-size:12px;font-weight:600;color:var(--dm);cursor:pointer;border-bottom:2px solid transparent;transition:color .15s,border-color .15s}
+.spawn-tab.active{color:var(--ac);border-bottom-color:var(--ac)}
+.spawn-tab:active{background:var(--bg)}
 </style>
 </head>
 <body>
@@ -490,15 +557,23 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 <div id="spawnOverlay" class="spawn-overlay" onclick="closeSpawnDialog()">
   <div class="spawn-modal" onclick="event.stopPropagation()">
     <div class="spawn-header"><h3>🚀 新規セッション</h3></div>
+    <div class="spawn-tabs">
+      <div id="tabRecent" class="spawn-tab active" onclick="switchSpawnTab('recent')">Recent</div>
+      <div id="tabBrowse" class="spawn-tab" onclick="switchSpawnTab('browse')">Browse</div>
+    </div>
     <div id="spawnForm" class="spawn-body">
-      <input id="spawnCwd" type="text" placeholder="/path/to/project" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
-      <div class="spawn-hint">作業ディレクトリを入力してください。新しい Pi プロセスが起動します。</div>
+      <div id="spawnRecent" class="spawn-section"></div>
+      <div id="spawnBrowse" class="spawn-section" style="display:none">
+        <div id="spawnPathBar" class="spawn-path-bar"></div>
+        <div id="spawnDirList"></div>
+      </div>
       <div id="spawnError" class="spawn-error"></div>
     </div>
     <div id="spawnLoading" class="spawn-loading">⚙️ セッションを起動中...</div>
     <div class="spawn-footer">
+      <div id="spawnSelPath" class="sf-path"></div>
       <button class="btn-cancel" onclick="closeSpawnDialog()">Cancel</button>
-      <button id="spawnBtn" class="btn-spawn" onclick="doSpawnSession()">Start</button>
+      <button id="spawnBtn" class="btn-spawn" disabled onclick="doSpawnSession()">Start</button>
     </div>
   </div>
 </div>
@@ -600,26 +675,129 @@ async function loadSidebarSessions(){
 }
 
 // ── 新規セッション起動 ────────────────────
+let spawnSelectedCwd='';
+let spawnCurrentTab='recent';
+
 function openSpawnDialog(){
   closeSidebar();
-  $('spawnCwd').value='';
+  spawnSelectedCwd='';
+  $('spawnSelPath').textContent='';
+  $('spawnBtn').disabled=true;
   $('spawnError').style.display='none';
-  $('spawnError').textContent='';
   $('spawnForm').style.display='';
   $('spawnLoading').style.display='none';
-  $('spawnBtn').disabled=false;
   $('spawnOverlay').classList.add('show');
-  setTimeout(()=>{
-    const el=$('spawnCwd');
-    el.focus();
-    el.onkeydown=e=>{ if(e.key==='Enter'){e.preventDefault();doSpawnSession();} };
-  },100);
+  switchSpawnTab('recent');
 }
 function closeSpawnDialog(){
   $('spawnOverlay').classList.remove('show');
 }
+function switchSpawnTab(tab){
+  spawnCurrentTab=tab;
+  $('tabRecent').classList.toggle('active',tab==='recent');
+  $('tabBrowse').classList.toggle('active',tab==='browse');
+  $('spawnRecent').style.display=tab==='recent'?'':'none';
+  $('spawnBrowse').style.display=tab==='browse'?'':'none';
+  if(tab==='recent') loadRecentDirs();
+  if(tab==='browse') browseTo(spawnSelectedCwd||'~');
+}
+function selectCwd(p){
+  spawnSelectedCwd=p;
+  $('spawnSelPath').textContent=p;
+  $('spawnBtn').disabled=false;
+}
+
+async function loadRecentDirs(){
+  const el=$('spawnRecent');
+  el.innerHTML='<div class="spawn-empty">読み込み中...</div>';
+  try{
+    const r=await fetch(api('/recent-dirs'));
+    const d=await r.json();
+    const dirs=d.dirs||[];
+    if(!dirs.length){
+      el.innerHTML='<div class="spawn-empty">最近のプロジェクトがありません</div>';
+      return;
+    }
+    el.innerHTML='<div class="spawn-section-title">Recent Projects</div>';
+    for(const dir of dirs){
+      const name=dir.split('/').filter(Boolean).slice(-2).join('/');
+      const item=document.createElement('div');
+      item.className='spawn-dir-item recent';
+      item.innerHTML='<div class="sdi-icon">📂</div><div class="sdi-name">'+esc(name)+'</div><div class="sdi-action">Start</div>';
+      item.title=dir;
+      item.onclick=()=>{ selectCwd(dir); doSpawnSession(); };
+      el.appendChild(item);
+    }
+  }catch(e){
+    el.innerHTML='<div class="spawn-empty">読み込み失敗</div>';
+  }
+}
+
+async function browseTo(dirPath){
+  const list=$('spawnDirList');
+  list.innerHTML='<div class="spawn-empty">読み込み中...</div>';
+  try{
+    const r=await fetch(api('/browse?path='+encodeURIComponent(dirPath)));
+    const d=await r.json();
+    // パスバーを更新
+    renderPathBar(d.current);
+    selectCwd(d.current);
+    list.innerHTML='';
+    // 親ディレクトリ
+    if(d.parent){
+      const up=document.createElement('div');
+      up.className='spawn-dir-item';
+      up.innerHTML='<div class="sdi-icon">⬆️</div><div class="sdi-name">..</div>';
+      up.onclick=()=>browseTo(d.parent);
+      list.appendChild(up);
+    }
+    if(!d.entries||!d.entries.length){
+      if(!d.parent) list.innerHTML='<div class="spawn-empty">サブディレクトリなし</div>';
+      else { const empty=document.createElement('div'); empty.className='spawn-empty'; empty.textContent='サブディレクトリなし'; list.appendChild(empty); }
+      return;
+    }
+    for(const e of d.entries){
+      const item=document.createElement('div');
+      item.className='spawn-dir-item';
+      item.innerHTML='<div class="sdi-icon">📁</div><div class="sdi-name">'+esc(e.name)+'</div><div class="sdi-arrow">›</div>';
+      item.onclick=()=>browseTo(e.path);
+      list.appendChild(item);
+    }
+  }catch(e){
+    list.innerHTML='<div class="spawn-empty">読み込み失敗</div>';
+  }
+}
+
+function renderPathBar(fullPath){
+  const bar=$('spawnPathBar');
+  bar.innerHTML='';
+  const parts=fullPath.split('/').filter(Boolean);
+  let accumulated='/';
+  // ルート
+  const root=document.createElement('span');
+  root.className='sp-seg';
+  root.textContent='/';
+  root.onclick=()=>browseTo('/');
+  bar.appendChild(root);
+  for(let i=0;i<parts.length;i++){
+    accumulated+=(i>0?'/':'')+parts[i];
+    const sep=document.createElement('span');
+    sep.className='sp-sep';
+    sep.textContent='/';
+    bar.appendChild(sep);
+    const seg=document.createElement('span');
+    seg.className='sp-seg';
+    seg.textContent=parts[i];
+    const target=accumulated;
+    seg.onclick=()=>browseTo(target);
+    bar.appendChild(seg);
+  }
+}
+
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
 async function doSpawnSession(){
-  const cwd=$('spawnCwd').value.trim();
+  const cwd=spawnSelectedCwd;
   if(!cwd) return;
   $('spawnBtn').disabled=true;
   $('spawnError').style.display='none';
@@ -635,21 +813,20 @@ async function doSpawnSession(){
     if(d.ok && d.session){
       addM('s','🚀 新セッション起動: '+d.session.sessionId);
       closeSpawnDialog();
-      // 新セッションにリダイレクト
       setTimeout(()=>{
         window.location.href=d.session.directUrl||d.session.url;
       },500);
     } else {
       $('spawnForm').style.display='';
       $('spawnLoading').style.display='none';
-      $('spawnBtn').disabled=false;
+      $('spawnBtn').disabled=!spawnSelectedCwd;
       $('spawnError').textContent=d.error||'起動に失敗しました';
       $('spawnError').style.display='block';
     }
   }catch(e){
     $('spawnForm').style.display='';
     $('spawnLoading').style.display='none';
-    $('spawnBtn').disabled=false;
+    $('spawnBtn').disabled=!spawnSelectedCwd;
     $('spawnError').textContent='通信エラー';
     $('spawnError').style.display='block';
   }
@@ -1108,16 +1285,37 @@ async function startServer(
       return;
     }
 
+    // 最近のプロジェクトディレクトリ一覧
+    if (pathname === "/recent-dirs") {
+      const dirs = getRecentProjectDirs();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ dirs }));
+      return;
+    }
+
+    // ディレクトリブラウザ
+    if (pathname === "/browse") {
+      const dirParam = reqUrl.searchParams.get("path") || os.homedir();
+      const resolved = path.resolve(expandTilde(dirParam));
+      const entries = listSubdirectories(resolved);
+      const parentDir = path.dirname(resolved);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ current: resolved, parent: parentDir !== resolved ? parentDir : null, entries }));
+      return;
+    }
+
     // 新しいセッションをスポーン
     if (req.method === "POST" && pathname === "/spawn-session") {
       const body = await readBody(req);
       try {
-        const { cwd: targetCwd } = JSON.parse(body);
+        let { cwd: targetCwd } = JSON.parse(body);
         if (!targetCwd || typeof targetCwd !== "string") {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: false, error: "cwd は必須です" }));
           return;
         }
+        // ~ 展開
+        targetCwd = path.resolve(expandTilde(targetCwd));
         // ディレクトリの存在チェック
         if (!fsSync.existsSync(targetCwd) || !fsSync.statSync(targetCwd).isDirectory()) {
           res.writeHead(400, { "Content-Type": "application/json" });
