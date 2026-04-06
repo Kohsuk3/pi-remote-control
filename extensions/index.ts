@@ -134,7 +134,7 @@ function spawnPiSession(cwd: string): { pid: number } {
     // stdout/stderr: pipe で受け取る（ignore だと書き込みエラーでプロセスが終了する）
     stdio: ["pipe", "pipe", "pipe"],
     detached: false,
-    env: { ...process.env },
+    env: { ...process.env, PI_REMOTE_SPAWNED: "1" },
   });
 
   if (!child.pid) {
@@ -371,8 +371,12 @@ function getTailscaleIP(): string {
 
 const SERVE_PATH = "/remote";
 
+/** スポーンされた子プロセスかどうか（子は tailscale serve を触らない） */
+const isSpawnedChild = process.env.PI_REMOTE_SPAWNED === "1";
+
 /** tailscale serve でパスベースのプロキシを設定（TLS終端はtailscaleが担当） */
 function setupTailscaleServe(port: number): boolean {
+  if (isSpawnedChild) return false; // 子プロセスは親の設定を上書きしない
   try {
     execSync(
       `tailscale serve --bg --set-path ${SERVE_PATH} http://localhost:${port}`,
@@ -385,6 +389,7 @@ function setupTailscaleServe(port: number): boolean {
 }
 
 function teardownTailscaleServe(): void {
+  if (isSpawnedChild) return; // 子プロセスは親の設定を削除しない
   try {
     execSync(`tailscale serve --set-path ${SERVE_PATH} off`, { stdio: "ignore" });
   } catch { /* ignore */ }
@@ -1358,6 +1363,8 @@ async function startServer(
         const killed = killSpawnedSession(targetPid);
         if (killed) {
           ctx.ui.notify(`📱 セッション終了: pid=${targetPid}`, "info");
+          // 子プロセスが tailscale serve を壊した場合の安全策: 親の設定を復元
+          setupTailscaleServe(port);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true }));
         } else {
