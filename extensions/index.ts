@@ -130,7 +130,9 @@ function spawnPiSession(cwd: string): { pid: number } {
 
   const child = spawn(piPath, ["--mode", "rpc"], {
     cwd,
-    stdio: ["pipe", "ignore", "ignore"],
+    // stdin: pipe で開いたまま保持し RPC モードを維持
+    // stdout/stderr: pipe で受け取る（ignore だと書き込みエラーでプロセスが終了する）
+    stdio: ["pipe", "pipe", "pipe"],
     detached: false,
     env: { ...process.env },
   });
@@ -147,8 +149,10 @@ function spawnPiSession(cwd: string): { pid: number } {
   });
 
   // stdin を開いたままにして RPC モードを維持
-  // エラーを無視（プロセス終了後に書き込みエラーが出る場合がある）
   child.stdin?.on("error", () => {});
+  // stdout/stderr を drain してバッファ溢れを防止
+  child.stdout?.resume();
+  child.stderr?.resume();
 
   return { pid };
 }
