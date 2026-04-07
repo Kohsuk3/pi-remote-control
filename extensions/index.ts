@@ -81,6 +81,10 @@ function respondWebConfirm(confirmId: string, confirmed: boolean): void {
     clearTimeout(pending.timer);
     pendingConfirms.delete(confirmId);
     pending.resolve(confirmed);
+    // eventLog に「解決済み」を追記 → リロード時にダイアログが再表示されないようにする
+    for (const [_, s] of sessionServers) {
+      pushEvent(s.sessionId, { type: "confirm:resolved", confirmId, confirmed });
+    }
   }
 }
 
