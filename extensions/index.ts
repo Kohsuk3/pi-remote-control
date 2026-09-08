@@ -1471,12 +1471,16 @@ async function startServer(
     startParentWatcher(port);
     // 他の拡張（Python LSP 等）の session_start 通知が出終わった後に表示されるよう遅延
     setTimeout(() => {
-      ctx.ui.notify([
-        `📱 Remote Control: ポート ${port}`,
-        `URL: ${url}`,
-        `Session: ${sessionId} | Dir: ${workingDir}`,
-        `/remote-toggle で切替え | /remote-status で詳細`,
-      ].join("\n"), "info");
+      try {
+        ctx.ui.notify([
+          `📱 Remote Control: ポート ${port}`,
+          `URL: ${url}`,
+          `Session: ${sessionId} | Dir: ${workingDir}`,
+          `/remote-toggle で切替え | /remote-status で詳細`,
+        ].join("\n"), "info");
+      } catch {
+        // ctx が session 切替後に stale になった場合は無視
+      }
     }, 1500);
   });
 
