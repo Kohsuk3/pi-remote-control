@@ -483,7 +483,14 @@ function teardownTailscaleServe(): void {
 function ensureHub(ownPort: number): void {
   const hub = readHub();
   if (hub && hub.pid !== process.pid && pidAlive(hub.pid)) return;
-  if (hub?.pid === process.pid && hub.port === ownPort) return;
+  if (hub?.pid === process.pid && hub.port === ownPort) {
+    // 古いバージョンのセッションが終了時に serve を消すことがある → 持ち主が実在確認して張り直す
+    try {
+      const st = execSync("tailscale serve status 2>&1", { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
+      if (!st.includes(SERVE_PATH)) setupTailscaleServe(ownPort);
+    } catch {}
+    return;
+  }
   if (!getTailscaleFQDN()) return;
   if (setupTailscaleServe(ownPort)) {
     fsSync.mkdirSync(path.dirname(HUB_PATH), { recursive: true });
