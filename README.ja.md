@@ -21,6 +21,15 @@ Tailscale HTTPS経由でセキュアに接続し、モバイル最適化され�
 - 🗑️ **セッション終了** — サイドバーから他のセッションを終了（確認ダイアログ付き）
 - 🇯🇵 **iOS日本語フリック入力対応** — Safariのバグ回避策を実装
 
+## 多セッション運用 (herdr)
+
+- 共有 URL (`tailscale serve` の `/remote`) の持ち主は `~/.pi/remote-control/hub.json` で 1 プロセスに固定。持ち主が終了しても生きているセッションが 5 秒以内に引き継ぐ
+- セッション切替は `/s/<sessionId>/…` 経由の中継でページ遷移なし（HTTPS のまま）
+- サイドバーは herdr の workspace 名 / 状態 (idle・working・blocked) を表示し、要対応 → 作業中 → 待機の順。6 件以上で絞り込み入力が出る。要対応が他にあるとハンバーガーに印
+- 新規セッションは herdr のタブ（同じ dir の workspace があればそこ、なければ新規 workspace）として起動。終了はペインを閉じる。herdr 外では従来の headless 起動
+- 中断ボタンは実際にエージェントを abort する
+- `test/smoke.sh` で hub 引継ぎ・中継・中断をスタブ環境で検証
+
 ## 前提条件
 
 - [Tailscale](https://tailscale.com/) がインストール・接続済み

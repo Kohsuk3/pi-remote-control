@@ -23,7 +23,7 @@ import net from "node:net";
 import crypto from "node:crypto";
 import path from "node:path";
 import fsSync from "node:fs";
-import { execSync, spawn, type ChildProcess } from "node:child_process";
+import { execSync, execFile, spawn, type ChildProcess } from "node:child_process";
 import os from "node:os";
 
 type Evt = { id: number; type: string; [k: string]: unknown };
@@ -133,7 +133,7 @@ function spawnPiSession(cwd: string): { pid: number } {
     cwd,
     stdio: ["ignore", "ignore", "ignore"],
     detached: true,
-    env: { ...process.env, PI_REMOTE_SPAWNED: "1", PI_REMOTE_PARENT_PID: String(process.pid) },
+    env: { ...process.env },
   });
 
   child.unref();
@@ -167,12 +167,14 @@ function findPiBinary(): string {
 
 /** sessions.json にスポーンしたセッションが登録されるのを待つ
  *  sh 経由で起動するため PID が変わるので、起動前のレジストリとの差分で検出 */
-async function waitForSpawnedSession(knownPids: Set<number>, timeoutMs: number = 15000): Promise<RegistryEntry | null> {
+async function waitForSpawnedSession(knownPids: Set<number>, paneId?: string, timeoutMs: number = 20000): Promise<RegistryEntry | null> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     await new Promise(r => setTimeout(r, 500));
     const entries = readRegistry();
-    const newEntry = entries.find(e => !knownPids.has(e.pid));
+    const newEntry = paneId
+      ? entries.find(e => e.paneId === paneId && !knownPids.has(e.pid))
+      : entries.find(e => !knownPids.has(e.pid));
     if (newEntry) return newEntry;
   }
   return null;
@@ -265,6 +267,8 @@ interface RegistryEntry {
   directUrl: string; // Tailscale IP + ポートの直接URL（セッション切り替え用）
   workingDir: string;
   pid: number;
+  paneId?: string; // HERDR_PANE_ID
+  sessionFile?: string; // herdr の agent_session と突き合わせる
 }
 
 function readRegistry(): RegistryEntry[] {
@@ -291,6 +295,93 @@ function registerSession(entry: RegistryEntry): void {
 
 function unregisterSession(sessionId: string): void {
   writeRegistry(readRegistry().filter(e => e.sessionId !== sessionId));
+}
+
+// ---- herdr 連携 ------------------------------------------------------------
+// herdr 配下で動いているとき、セッションの実体は herdr のペイン。
+// 一覧の表示名/状態は herdr から取り、起動/終了もペイン操作で行う（headless rpc は見えない子になるため）。
+
+const HERDR_BIN = process.env.HERDR_BIN_PATH || "herdr";
+const HERDR_ON = process.env.HERDR_ENV === "1";
+
+function herdrJson(args: string[]): Promise<any | null> {
+  return new Promise((resolve) => {
+    execFile(HERDR_BIN, args, { timeout: 4000, encoding: "utf-8" }, (err, out) => {
+      if (err) return resolve(null);
+      try { resolve(JSON.parse(out).result ?? null); } catch { resolve(null); }
+    });
+  });
+}
+
+interface HerdrPane {
+  paneId: string;
+  workspaceId: string;
+  workspace: string;
+  status: string; // idle | working | blocked | unknown
+  cwd: string;
+  sessionFile?: string;
+}
+
+let herdrCache: { at: number; panes: HerdrPane[] } = { at: 0, panes: [] };
+
+async function herdrSnapshot(maxAgeMs = 2000): Promise<HerdrPane[]> {
+  if (!HERDR_ON) return [];
+  if (Date.now() - herdrCache.at < maxAgeMs) return herdrCache.panes;
+  const [panes, wss] = await Promise.all([herdrJson(["pane", "list"]), herdrJson(["workspace", "list"])]);
+  if (!panes?.panes) return herdrCache.panes; // 失敗時は古い値で凌ぐ
+  const labels = new Map<string, string>((wss?.workspaces ?? []).map((w: any) => [w.workspace_id, w.label]));
+  herdrCache = {
+    at: Date.now(),
+    panes: panes.panes.map((p: any): HerdrPane => ({
+      paneId: p.pane_id,
+      workspaceId: p.workspace_id,
+      workspace: labels.get(p.workspace_id) ?? p.workspace_id,
+      status: p.agent_status ?? "unknown",
+      cwd: p.cwd ?? "",
+      sessionFile: p.agent_session?.kind === "path" ? p.agent_session.value : undefined,
+    })),
+  };
+  return herdrCache.panes;
+}
+
+function matchPane(panes: HerdrPane[], e: RegistryEntry): HerdrPane | undefined {
+  return (e.sessionFile && panes.find(p => p.sessionFile === e.sessionFile))
+    || (e.paneId ? panes.find(p => p.paneId === e.paneId) : undefined);
+}
+
+interface SessionView extends RegistryEntry {
+  workspace?: string;
+  status: string;
+  paneKnown: boolean;
+}
+
+/** レジストリ + herdr の状態。blocked → working → idle → unknown の順、同順位は workspace 名 */
+async function listSessionViews(): Promise<SessionView[]> {
+  const panes = await herdrSnapshot();
+  const rank: Record<string, number> = { blocked: 0, working: 1, idle: 2, unknown: 3 };
+  return readRegistry()
+    .map((e): SessionView => {
+      const p = matchPane(panes, e);
+      return { ...e, workspace: p?.workspace, status: p?.status ?? "unknown", paneKnown: !!p };
+    })
+    .sort((a, b) =>
+      (rank[a.status] ?? 3) - (rank[b.status] ?? 3)
+      || (a.workspace ?? a.workingDir).localeCompare(b.workspace ?? b.workingDir)
+      || a.port - b.port);
+}
+
+/** herdr のタブ（無ければワークスペース）を作って pi を走らせる。成功時はペイン ID */
+async function spawnInHerdr(cwd: string): Promise<string | null> {
+  const panes = await herdrSnapshot(0);
+  const sameDir = panes.find(p => p.cwd === cwd);
+  const label = path.basename(cwd) || cwd;
+  const created = sameDir
+    ? await herdrJson(["tab", "create", "--workspace", sameDir.workspaceId, "--cwd", cwd, "--label", label])
+    : await herdrJson(["workspace", "create", "--cwd", cwd, "--label", label, "--no-focus"]);
+  const paneId: string | undefined = created?.root_pane?.pane_id;
+  if (!paneId) return null;
+  const run = await herdrJson(["pane", "run", paneId, findPiBinary()]);
+  return run ? paneId : null;
 }
 
 function extractText(message: any): string {
@@ -353,14 +444,19 @@ function getTailscaleIP(): string {
 
 const SERVE_PATH = "/remote";
 
-/** スポーンされた子プロセスかどうか（子は tailscale serve を触らない） */
-let isSpawnedChild = process.env.PI_REMOTE_SPAWNED === "1";
-const parentPid = process.env.PI_REMOTE_PARENT_PID ? parseInt(process.env.PI_REMOTE_PARENT_PID, 10) : null;
-let parentWatchTimer: ReturnType<typeof setInterval> | null = null;
+const HUB_PATH = path.join(os.homedir(), ".pi", "remote-control", "hub.json");
+let hubTimer: ReturnType<typeof setInterval> | null = null;
+
+function pidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function readHub(): { pid: number; port: number } | null {
+  try { return JSON.parse(fsSync.readFileSync(HUB_PATH, "utf-8")); } catch { return null; }
+}
 
 /** tailscale serve でパスベースのプロキシを設定（TLS終端はtailscaleが担当） */
 function setupTailscaleServe(port: number): boolean {
-  if (isSpawnedChild) return false; // 子プロセスは親の設定を上書きしない
   try {
     execSync(
       `tailscale serve --bg --set-path ${SERVE_PATH} http://localhost:${port}`,
@@ -373,30 +469,42 @@ function setupTailscaleServe(port: number): boolean {
 }
 
 function teardownTailscaleServe(): void {
-  if (isSpawnedChild) return; // 子プロセスは親の設定を削除しない
   try {
     execSync(`tailscale serve --set-path ${SERVE_PATH} off`, { stdio: "ignore" });
   } catch {}
 }
 
-/** 親プロセスの生存監視を開始。親が死んだら tailscale serve を引き継ぐ */
-function startParentWatcher(ownPort: number): void {
-  if (!isSpawnedChild || !parentPid) return;
-  parentWatchTimer = setInterval(() => {
-    try {
-      process.kill(parentPid, 0); // 生存確認（シグナルは送らない）
-    } catch {
-      // 親が死んだ → tailscale serve を引き継ぐ
-      isSpawnedChild = false;
-      if (parentWatchTimer) { clearInterval(parentWatchTimer); parentWatchTimer = null; }
-      const fqdn = getTailscaleFQDN();
-      if (fqdn) setupTailscaleServe(ownPort);
-    }
-  }, 5000);
+/**
+ * 共有 URL (tailscale serve の /remote) の持ち主を 1 プロセスに固定する。
+ * 以前は「最後に起動したセッションが奪う / どれかが終了すると serve を消す」ため、
+ * セッションが多いと URL が頻繁に死んでいた。持ち主が死んだら生きている誰かが 5 秒以内に引き継ぐ。
+ * ponytail: hub.json の書き込み競合は後勝ち。厳密な排他が要るなら lockfile。
+ */
+function ensureHub(ownPort: number): void {
+  const hub = readHub();
+  if (hub && hub.pid !== process.pid && pidAlive(hub.pid)) return;
+  if (hub?.pid === process.pid && hub.port === ownPort) return;
+  if (!getTailscaleFQDN()) return;
+  if (setupTailscaleServe(ownPort)) {
+    fsSync.mkdirSync(path.dirname(HUB_PATH), { recursive: true });
+    fsSync.writeFileSync(HUB_PATH, JSON.stringify({ pid: process.pid, port: ownPort }));
+  }
 }
 
-function stopParentWatcher(): void {
-  if (parentWatchTimer) { clearInterval(parentWatchTimer); parentWatchTimer = null; }
+function startHubWatcher(ownPort: number): void {
+  ensureHub(ownPort);
+  if (hubTimer) clearInterval(hubTimer);
+  hubTimer = setInterval(() => ensureHub(ownPort), 5000);
+  hubTimer.unref?.();
+}
+
+/** 終了時: 持ち主だったなら hub.json を消す。他に生存セッションがいなければ serve も外す */
+function releaseHub(): void {
+  if (hubTimer) { clearInterval(hubTimer); hubTimer = null; }
+  if (readHub()?.pid === process.pid) {
+    try { fsSync.unlinkSync(HUB_PATH); } catch {}
+  }
+  if (readRegistry().length === 0) teardownTailscaleServe();
 }
 
 /** リモートアクセス URL を生成 */
@@ -490,13 +598,18 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 .btn-yes:hover{opacity:.85}
 .confirm-timer{padding:0 16px 8px;font-size:12px;color:var(--dm);text-align:center}
 
-#hamburger{width:36px;height:36px;border-radius:8px;border:none;background:transparent;cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;padding:0;flex-shrink:0;-webkit-tap-highlight-color:transparent}
+#hamburger{position:relative;width:36px;height:36px;border-radius:8px;border:none;background:transparent;cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;padding:0;flex-shrink:0;-webkit-tap-highlight-color:transparent}
 #hamburger span{display:block;width:20px;height:2px;background:var(--tx);border-radius:2px;transition:transform .3s ease,opacity .3s ease,top .3s ease}
 #hamburger:active{background:var(--bd)}
 #hamburger.open span:nth-child(1){transform:translateY(7px) rotate(45deg)}
 #hamburger.open span:nth-child(2){opacity:0;transform:scaleX(0)}
 #hamburger.open span:nth-child(3){transform:translateY(-7px) rotate(-45deg)}
 
+#hamburger.attn::after{content:'';position:absolute;top:3px;right:3px;width:9px;height:9px;border-radius:50%;background:#f59e0b;animation:pulse 1s infinite}
+.st{width:10px;height:10px;border-radius:50%;background:#555;flex-shrink:0}
+.st.idle{background:var(--ok)}.st.working{background:var(--ac);animation:pulse .8s infinite}.st.blocked{background:#f59e0b;animation:pulse 1s infinite}
+.sb-filter{margin:8px 12px 0;padding:10px 12px;border-radius:10px;border:1px solid var(--bd);background:var(--bg);color:var(--tx);font-size:16px;font-family:var(--fn);outline:none;display:none}
+.sb-filter:focus{border-color:var(--ac)}
 .sb-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:50;backdrop-filter:blur(2px);-webkit-backdrop-filter:blur(2px);transition:opacity .3s}
 .sb-backdrop.open{display:block;animation:bdIn .25s ease forwards}
 @keyframes bdIn{from{opacity:0}to{opacity:1}}
@@ -515,6 +628,7 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 .sb-item-sub{font-size:11px;color:var(--dm);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--fm)}
 .sb-cur-dot{width:8px;height:8px;border-radius:50%;background:var(--ok);flex-shrink:0;box-shadow:0 0 6px var(--ok)}
 .sb-item-badge{font-size:10px;font-weight:600;color:var(--ac);background:rgba(124,58,237,.15);padding:3px 8px;border-radius:20px;border:1px solid rgba(124,58,237,.3);flex-shrink:0;white-space:nowrap}
+.sb-item-badge.blocked{color:#f59e0b;background:rgba(245,158,11,.15);border-color:rgba(245,158,11,.4)}
 .sb-item-close{width:28px;height:28px;border-radius:50%;border:none;background:transparent;color:var(--dm);font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;-webkit-tap-highlight-color:transparent;transition:background .15s,color .15s}
 .sb-item-close:active{background:rgba(239,68,68,.15);color:var(--er)}
 
@@ -562,6 +676,7 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 <div id="sbBackdrop" class="sb-backdrop" onclick="closeSidebar()"></div>
 <nav id="sidebar" class="sidebar">
   <div class="sb-header">Sessions</div>
+  <input id="sbFilter" class="sb-filter" type="search" placeholder="絞り込み (workspace / dir / id)" oninput="renderSidebar()">
   <div id="sbList" class="sb-list"></div>
   <div class="sb-new-btn" onclick="openSpawnDialog()">
     <div class="sb-new-icon">➕</div>
@@ -634,8 +749,10 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 
 <script>
 const $=s=>document.getElementById(s);
-const BASE=(()=>{const p=location.pathname.replace(/\\/$/, '');return p||'';})();
-function api(path){return BASE+path;}
+const ROOT=(()=>{let p=location.pathname;const i=p.indexOf('/s/');if(i>=0)p=p.slice(0,i);while(p.endsWith('/'))p=p.slice(0,-1);return p;})();
+let target=(()=>{const p=location.pathname,i=p.indexOf('/s/');if(i<0)return '';const r=p.slice(i+3),j=r.indexOf('/');return j<0?r:r.slice(0,j);})();
+let epoch=0;
+function api(path){return ROOT+(target?'/s/'+target:'')+path;}
 const msgs=$("msgs"), inp=$("inp"), dot=$("dot"), hm=$("hm"), sndBtn=$("snd"), stpBtn=$("stp");
 let lastId=0, processing=false, streamEl=null, sentLocally=false;
 let currentConfirmId=null, confirmTimerEl=null;
@@ -647,57 +764,76 @@ function toggleSidebar(){
   sb.classList.toggle('open',opening);
   bd.classList.toggle('open',opening);
   hb.classList.toggle('open',opening);
-  if(opening) loadSidebarSessions();
+  if(opening) refreshSessions();
 }
 function closeSidebar(){
   $('sidebar').classList.remove('open');
   $('sbBackdrop').classList.remove('open');
   $('hamburger').classList.remove('open');
 }
-async function loadSidebarSessions(){
+function dirTail(w,n){return (w||'').split('/').filter(Boolean).slice(-n).join('/');}
+let sessionsCache=[];
+async function refreshSessions(){
   try{
-    const r=await fetch(api('/sessions'));
-    const d=await r.json();
-    const sessions=d.sessions||[];
-    const cur=d.current||currentSessionId;
-    const list=$('sbList');
-    list.innerHTML='';
-    if(!sessions.length){
-      list.innerHTML='<div style="padding:20px;color:var(--dm);font-size:13px;text-align:center">セッションなし</div>';
-      return;
-    }
-    for(const s of sessions){
-      const isCur=s.sessionId===cur;
-      const dir=s.workingDir.split('/').slice(-2).join('/');
-      const item=document.createElement('div');
-      item.className='sb-item'+(isCur?' active':'');
-      item.innerHTML=
-        '<div class="sb-item-icon">'+(isCur?'🖥️':'💻')+'</div>'+
-        '<div class="sb-item-body">'+
-          '<div class="sb-item-name">'+esc(dir)+'</div>'+
-          '<div class="sb-item-sub">'+s.sessionId+' · :'+s.port+'</div>'+
-        '</div>'+
-        (isCur?'<div class="sb-cur-dot"></div>':'<div class="sb-item-badge">切替</div>');
-      item.onclick=()=>{
-        closeSidebar();
-        if(!isCur) window.location.href=s.directUrl||s.url;
-      };
-      if(!isCur){
-        const closeBtn=document.createElement('button');
-        closeBtn.className='sb-item-close';
-        closeBtn.textContent='×';
-        closeBtn.title='セッションを終了';
-        closeBtn.onclick=(e)=>{
-          e.stopPropagation();
-          confirmKillSession(s.sessionId, s.pid, dir);
-        };
-        item.appendChild(closeBtn);
-      }
-      list.appendChild(item);
-    }
+    const r=await fetch(ROOT+'/sessions');
+    if(!r.ok) throw 0;
+    sessionsCache=(await r.json()).sessions||[];
+    const cur=sessionsCache.find(x=>x.sessionId===target||(!target&&x.sessionId===currentSessionId));
+    if(cur){ $('hdTitle').textContent=cur.workspace||dirTail(cur.workingDir,1); }
+    $('hamburger').classList.toggle('attn',sessionsCache.some(x=>x.status==='blocked'&&x.sessionId!==currentSessionId));
+    renderSidebar();
   }catch(e){
-    $('sbList').innerHTML='<div style="padding:20px;color:var(--er);font-size:13px;text-align:center">読み込み失敗</div>';
+    if($('sidebar').classList.contains('open')) $('sbList').innerHTML='<div style="padding:20px;color:var(--er);font-size:13px;text-align:center">読み込み失敗</div>';
   }
+}
+function renderSidebar(){
+  const list=$('sbList'), f=$('sbFilter');
+  f.style.display=sessionsCache.length>5?'block':'none';
+  const q=f.value.trim().toLowerCase();
+  const shown=sessionsCache.filter(s=>!q||((s.workspace||'')+' '+s.workingDir+' '+s.sessionId).toLowerCase().includes(q));
+  list.innerHTML='';
+  if(!shown.length){
+    list.innerHTML='<div style="padding:20px;color:var(--dm);font-size:13px;text-align:center">セッションなし</div>';
+    return;
+  }
+  for(const s of shown){
+    const isCur=s.sessionId===currentSessionId;
+    const dir=dirTail(s.workingDir,2);
+    const item=document.createElement('div');
+    item.className='sb-item'+(isCur?' active':'');
+    item.innerHTML=
+      '<div class="sb-item-icon"><span class="st '+esc(s.status||'')+'" style="display:inline-block"></span></div>'+
+      '<div class="sb-item-body">'+
+        '<div class="sb-item-name">'+esc(s.workspace||dir)+'</div>'+
+        '<div class="sb-item-sub">'+esc(s.workspace?dir+' · ':'')+s.sessionId+'</div>'+
+      '</div>'+
+      (s.status==='blocked'?'<div class="sb-item-badge blocked">要対応</div>':isCur?'<div class="sb-cur-dot"></div>':'');
+    item.onclick=()=>{ closeSidebar(); if(!isCur) switchSession(s.sessionId); };
+    if(!isCur){
+      const closeBtn=document.createElement('button');
+      closeBtn.className='sb-item-close';
+      closeBtn.textContent='×';
+      closeBtn.title='セッションを終了';
+      closeBtn.onclick=(e)=>{ e.stopPropagation(); confirmKillSession(s.sessionId, s.pid, s.workspace||dir); };
+      item.appendChild(closeBtn);
+    }
+    list.appendChild(item);
+  }
+}
+function resetUi(){
+  epoch++; lastId=0; streamEl=null; sentLocally=false; processing=false;
+  msgs.innerHTML='';
+  if(confirmTimerEl){ clearInterval(confirmTimerEl); confirmTimerEl=null; }
+  currentConfirmId=null;
+  $('confirmOverlay').classList.remove('show');
+  sndBtn.classList.remove('off'); stpBtn.classList.remove('on'); inp.disabled=false;
+  dot.className='dot';
+}
+function switchSession(id){
+  target=id;
+  resetUi();
+  try{ history.replaceState(null,'',ROOT+'/s/'+id+'/'); }catch(e){}
+  init();
 }
 
 function confirmKillSession(sessionId, pid, dirName){
@@ -715,7 +851,7 @@ async function killSession(pid){
     if(d.ok){
       addM('s','🗑️ セッション終了 (pid='+pid+')');
       // プロセス終了の反映を待ってサイドバーを更新
-      setTimeout(loadSidebarSessions, 1500);
+      setTimeout(refreshSessions, 1500);
     } else {
       addM('s','❌ 終了失敗: '+(d.error||''));
     }
@@ -859,9 +995,7 @@ async function doSpawnSession(){
     if(d.ok && d.session){
       addM('s','🚀 新セッション起動: '+d.session.sessionId);
       closeSpawnDialog();
-      setTimeout(()=>{
-        window.location.href=d.session.directUrl||d.session.url;
-      },500);
+      switchSession(d.session.sessionId);
     } else {
       $('spawnForm').style.display='';
       $('spawnLoading').style.display='none';
@@ -1026,9 +1160,12 @@ function handleEvents(events){
 }
 
 async function init(){
+  const ep=epoch;
   try{
     const r=await fetch(api("/poll?since=0"));
+    if(!r.ok) throw 0;
     const d=await r.json();
+    if(ep!==epoch) return;
     if(d.sessionId){
       dot.className="dot ok";
       updateSessionLabel(d.sessionId);
@@ -1036,24 +1173,38 @@ async function init(){
       addM("s","🔗 接続完了 ("+d.sessionId+")");
       handleEvents(d.events||[]);
       fetchModels();
+      refreshSessions();
       streamLoop();
     }
-  }catch(e){ setTimeout(init,2000); }
+  }catch(e){
+    if(ep!==epoch) return;
+    dot.className="dot wait";
+    setTimeout(init,2000);
+  }
 }
 
 async function streamLoop(){
-  while(true){
+  const ep=epoch;
+  let fails=0;
+  while(ep===epoch){
     try{
       const r=await fetch(api("/stream?since="+lastId));
+      if(!r.ok) throw 0;
       const d=await r.json();
-      dot.className="dot ok";
+      if(ep!==epoch) return;
+      fails=0;
+      dot.className=processing?"dot work":"dot ok";
       handleEvents(d.events||[]);
     }catch(e){
+      if(ep!==epoch) return;
       dot.className="dot wait";
+      if(++fails===5){ addM("s","⚠️ セッションに接続できません。サイドバーから別のセッションを選べます"); refreshSessions(); }
       await new Promise(r=>setTimeout(r,2000));
     }
   }
 }
+
+setInterval(refreshSessions,5000);
 
 async function send(){
   const t=inp.value.trim();
@@ -1198,7 +1349,7 @@ async function startServer(
   const html = generateHTML();
 
   const fqdn = getTailscaleFQDN();
-  const useTailscaleServe = !!fqdn && setupTailscaleServe(port);
+  const useTailscaleServe = !!fqdn;
   const url = buildRemoteUrl(port, fqdn, useTailscaleServe);
 
   const httpServer = http.createServer();
@@ -1232,7 +1383,35 @@ async function startServer(
 
   httpServer.on("request", async (req: http.IncomingMessage, res: http.ServerResponse) => {
     const reqUrl = new URL(req.url || "/", `http://${req.headers.host}`);
-    const pathname = reqUrl.pathname;
+    let pathname = reqUrl.pathname;
+
+    // /s/<sessionId>/... → そのセッションへ中継。共有 HTTPS URL 1 本で全セッションを切り替えられる
+    // (以前は http://<tailscale-ip>:<port> へページ遷移していた)
+    if (pathname.startsWith("/s/")) {
+      const rest = pathname.slice(3);
+      const slash = rest.indexOf("/");
+      const targetId = slash < 0 ? rest : rest.slice(0, slash);
+      pathname = slash < 0 ? "/" : rest.slice(slash);
+      if (targetId !== sessionId) {
+        const target = readRegistry().find(e => e.sessionId === targetId);
+        if (!target) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end('{"error":"session not found"}');
+          return;
+        }
+        const upstream = http.request(
+          { host: "127.0.0.1", port: target.port, method: req.method, path: pathname + reqUrl.search, headers: { ...req.headers, host: `127.0.0.1:${target.port}` } },
+          (ur) => { res.writeHead(ur.statusCode || 502, ur.headers); ur.pipe(res); },
+        );
+        upstream.on("error", () => {
+          if (!res.headersSent) res.writeHead(502, { "Content-Type": "application/json" });
+          res.end('{"error":"upstream unavailable"}');
+        });
+        res.on("close", () => upstream.destroy());
+        req.pipe(upstream);
+        return;
+      }
+    }
 
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -1315,7 +1494,7 @@ async function startServer(
     }
 
     if (pathname === "/sessions") {
-      const sessions = readRegistry();
+      const sessions = await listSessionViews();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ sessions, current: sessionId }));
       return;
@@ -1336,11 +1515,14 @@ async function startServer(
           res.end(JSON.stringify({ ok: false, error: "現在接続中のセッションは終了できません" }));
           return;
         }
-        const killed = killSpawnedSession(targetPid);
+        // herdr ペインで動いているものはペインごと閉じる (シェルだけが残らないように)
+        const entry = readRegistry().find(e => e.pid === targetPid);
+        const pane = entry ? matchPane(await herdrSnapshot(0), entry) : undefined;
+        const killed = pane
+          ? !!(await herdrJson(["pane", "close", pane.paneId]))
+          : killSpawnedSession(targetPid);
         if (killed) {
           ctx.ui.notify(`📱 セッション終了: pid=${targetPid}`, "info");
-          // 子プロセスが tailscale serve を壊した場合の安全策: 親の設定を復元
-          setupTailscaleServe(port);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true }));
         } else {
@@ -1389,9 +1571,11 @@ async function startServer(
         ctx.ui.notify(`📱 新セッション起動: ${targetCwd}`, "info");
         // 起動前のレジストリ PID を記録
         const knownPids = new Set(readRegistry().map(e => e.pid));
-        const { pid: shPid } = spawnPiSession(targetCwd);
+        // herdr 配下なら herdr のタブとして起動 (TUI で見えるセッションにする)。失敗時のみ headless rpc
+        const paneId = HERDR_ON ? await spawnInHerdr(targetCwd) : null;
+        if (!paneId) spawnPiSession(targetCwd);
         // sessions.json に新エントリが登録されるのを待つ
-        const entry = await waitForSpawnedSession(knownPids);
+        const entry = await waitForSpawnedSession(knownPids, paneId ?? undefined);
         if (entry) {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true, session: entry }));
@@ -1448,6 +1632,7 @@ async function startServer(
 
     if (req.method === "POST" && pathname === "/interrupt") {
       ctx.ui.notify("🛑 リモート中断要求", "warning");
+      try { ctx.abort(); } catch {}
       pushEvent(sessionId, { type: "agent:interrupted" });
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end('{"ok":true}');
@@ -1466,9 +1651,10 @@ async function startServer(
   httpServer.listen(port, "0.0.0.0", () => {
     ctx.ui.setStatus("remote-ctrl", ctx.ui.theme.fg("success", `📱 :${port}`));
     const directUrl = `http://${getTailscaleIP()}:${port}`;
-    registerSession({ sessionId, port, url, directUrl, workingDir, pid: process.pid });
-    // 親プロセスの生存監視を開始（子プロセスのみ）
-    startParentWatcher(port);
+    let sessionFile: string | undefined;
+    try { sessionFile = ctx.sessionManager.getSessionFile?.() ?? undefined; } catch {}
+    registerSession({ sessionId, port, url, directUrl, workingDir, pid: process.pid, paneId: process.env.HERDR_PANE_ID, sessionFile });
+    startHubWatcher(port);
     // 他の拡張（Python LSP 等）の session_start 通知が出終わった後に表示されるよう遅延
     setTimeout(() => {
       try {
@@ -1495,14 +1681,13 @@ async function startServer(
 function stopServer(sessionId: string): void {
   const s = sessionServers.get(sessionId);
   if (!s) return;
-  stopParentWatcher();
   pushEvent(sessionId, { type: "server:shutdown" });
   for (const wc of s.waitingClients.values()) clearTimeout(wc.timer);
   s.httpServer.close(() => {});
   occupiedPorts.delete(s.port);
   sessionServers.delete(sessionId);
   unregisterSession(sessionId);
-  teardownTailscaleServe();
+  releaseHub();
 }
 
 export default function (pi: ExtensionAPI) {
