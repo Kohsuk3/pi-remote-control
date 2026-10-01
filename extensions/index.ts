@@ -42,6 +42,7 @@ interface ServerInstance {
   eventLog: Evt[];
   waitingClients: Map<string, WaitingClient>;
   nextEventId: number;
+  boot: string; // サーバー再起動(リロード)をクライアントが検知するため
 }
 
 interface PendingConfirm {
@@ -394,7 +395,8 @@ async function spawnInHerdr(cwd: string): Promise<string | null> {
 }
 
 function extractText(message: any): string {
-  if (!message?.content) return "";
+  if (typeof message?.content === "string") return message.content.trim();
+  if (!Array.isArray(message?.content)) return "";
   return message.content
     .filter((c: any) => c.type === "text" && c.text)
     .map((c: any) => c.text)
@@ -768,7 +770,7 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 const $=s=>document.getElementById(s);
 const ROOT=(()=>{let p=location.pathname;const i=p.indexOf('/s/');if(i>=0)p=p.slice(0,i);while(p.endsWith('/'))p=p.slice(0,-1);return p;})();
 let target=(()=>{const p=location.pathname,i=p.indexOf('/s/');if(i<0)return '';const r=p.slice(i+3),j=r.indexOf('/');return j<0?r:r.slice(0,j);})();
-let epoch=0;
+let epoch=0, bootId='';
 function api(path){return ROOT+(target?'/s/'+target:'')+path;}
 const msgs=$("msgs"), inp=$("inp"), dot=$("dot"), hm=$("hm"), sndBtn=$("snd"), stpBtn=$("stp");
 let lastId=0, processing=false, streamEl=null, sentLocally=false;
@@ -839,7 +841,7 @@ function renderSidebar(){
   }
 }
 function resetUi(){
-  epoch++; lastId=0; streamEl=null; sentLocally=false; processing=false;
+  epoch++; lastId=0; bootId=''; streamEl=null; sentLocally=false; processing=false;
   msgs.innerHTML='';
   if(confirmTimerEl){ clearInterval(confirmTimerEl); confirmTimerEl=null; }
   currentConfirmId=null;
@@ -1189,6 +1191,7 @@ async function init(){
       updateSessionLabel(d.sessionId);
       hm.textContent=":"+d.port;
       addM("s","🔗 接続完了 ("+d.sessionId+")");
+      bootId=d.boot||'';
       handleEvents(d.events||[]);
       fetchModels();
       refreshSessions();
@@ -1206,11 +1209,12 @@ async function streamLoop(){
   let fails=0;
   while(ep===epoch){
     try{
-      const r=await fetch(api("/stream?since="+lastId));
+      const r=await fetch(api("/stream?since="+lastId+"&boot="+bootId));
       if(!r.ok) throw 0;
       const d=await r.json();
       if(ep!==epoch) return;
       fails=0;
+      if(d.reset){ msgs.innerHTML=''; lastId=0; streamEl=null; bootId=d.boot||''; addM("s","🔄 セッション再読み込み"); }
       dot.className=processing?"dot work":"dot ok";
       handleEvents(d.events||[]);
     }catch(e){
@@ -1381,6 +1385,7 @@ async function startServer(
     eventLog: [],
     waitingClients: new Map(),
     nextEventId: 1,
+    boot: crypto.randomUUID().slice(0, 8),
   };
   sessionServers.set(sessionId, instance);
   occupiedPorts.add(port);
@@ -1390,6 +1395,7 @@ async function startServer(
   try {
     const history = ctx.sessionManager.buildSessionContext();
     for (const msg of history.messages) {
+      if (msg.role !== "user" && msg.role !== "assistant") continue;
       const text = extractText(msg);
       if (!text) continue;
       if (msg.role === "user") {
@@ -1443,13 +1449,18 @@ async function startServer(
       const since = parseInt(reqUrl.searchParams.get("since") || "0", 10);
       const events = instance.eventLog.filter(e => e.id > since);
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ sessionId, port, workingDir, events }));
+      res.end(JSON.stringify({ sessionId, port, workingDir, events, boot: instance.boot }));
       return;
     }
 
     // Long-poll: イベント到着まで最大 25 秒待機
     if (pathname === "/stream") {
       const since = parseInt(reqUrl.searchParams.get("since") || "0", 10);
+      if (reqUrl.searchParams.get("boot") !== instance.boot) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ reset: true, boot: instance.boot, events: instance.eventLog }));
+        return;
+      }
       const pending = instance.eventLog.filter(e => e.id > since);
       if (pending.length > 0) {
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -1726,7 +1737,12 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_e, ctx) => {
     workingDir = ctx.cwd;
-    sessionId = crypto.randomUUID().slice(0, 8);
+    // リロードしてもWeb UIが同じIDで再接続できるよう、セッションファイルから決める
+    let file: string | undefined;
+    try { file = ctx.sessionManager.getSessionFile?.() ?? undefined; } catch {}
+    sessionId = file
+      ? crypto.createHash("sha1").update(file).digest("hex").slice(0, 8)
+      : crypto.randomUUID().slice(0, 8);
     if (!isRemoteEnabled) {
       ctx.ui.setStatus("remote-ctrl", ctx.ui.theme.fg("dim", "📱 off"));
       return;
