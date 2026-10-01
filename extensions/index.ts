@@ -268,6 +268,7 @@ interface RegistryEntry {
   workingDir: string;
   pid: number;
   paneId?: string; // HERDR_PANE_ID
+  lastPrompt?: string; // サイドバーで何のセッションか分かるように
   sessionFile?: string; // herdr の agent_session と突き合わせる
 }
 
@@ -290,6 +291,14 @@ function writeRegistry(entries: RegistryEntry[]): void {
 function registerSession(entry: RegistryEntry): void {
   const entries = readRegistry().filter(e => e.sessionId !== entry.sessionId);
   entries.push(entry);
+  writeRegistry(entries);
+}
+
+function patchRegistry(sessionId: string, patch: Partial<RegistryEntry>): void {
+  const entries = readRegistry();
+  const e = entries.find(x => x.sessionId === sessionId);
+  if (!e) return;
+  Object.assign(e, patch);
   writeRegistry(entries);
 }
 
@@ -632,6 +641,7 @@ pre,code{background:var(--bg);padding:4px 8px;border-radius:6px;font-family:var(
 .sb-item-icon{font-size:20px;flex-shrink:0;width:32px;text-align:center}
 .sb-item-body{flex:1;min-width:0}
 .sb-item-name{font-size:13px;font-weight:600;color:var(--tx);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:2px}
+.sb-item-prompt{font-size:12px;color:var(--tx);opacity:.8;margin-bottom:2px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.35}
 .sb-item-sub{font-size:11px;color:var(--dm);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--fm)}
 .sb-cur-dot{width:8px;height:8px;border-radius:50%;background:var(--ok);flex-shrink:0;box-shadow:0 0 6px var(--ok)}
 .sb-item-badge{font-size:10px;font-weight:600;color:var(--ac);background:rgba(124,58,237,.15);padding:3px 8px;border-radius:20px;border:1px solid rgba(124,58,237,.3);flex-shrink:0;white-space:nowrap}
@@ -797,7 +807,7 @@ function renderSidebar(){
   const list=$('sbList'), f=$('sbFilter');
   f.style.display=sessionsCache.length>5?'block':'none';
   const q=f.value.trim().toLowerCase();
-  const shown=sessionsCache.filter(s=>!q||((s.workspace||'')+' '+s.workingDir+' '+s.sessionId).toLowerCase().includes(q));
+  const shown=sessionsCache.filter(s=>!q||((s.workspace||'')+' '+s.workingDir+' '+s.sessionId+' '+(s.lastPrompt||'')).toLowerCase().includes(q));
   list.innerHTML='';
   if(!shown.length){
     list.innerHTML='<div style="padding:20px;color:var(--dm);font-size:13px;text-align:center">セッションなし</div>';
@@ -812,6 +822,7 @@ function renderSidebar(){
       '<div class="sb-item-icon"><span class="st '+esc(s.status||'')+'" style="display:inline-block"></span></div>'+
       '<div class="sb-item-body">'+
         '<div class="sb-item-name">'+esc(s.workspace||dir)+'</div>'+
+        (s.lastPrompt?'<div class="sb-item-prompt">'+esc(s.lastPrompt)+'</div>':'')+
         '<div class="sb-item-sub">'+esc(s.workspace?dir+' · ':'')+s.sessionId+'</div>'+
       '</div>'+
       (s.status==='blocked'?'<div class="sb-item-badge blocked">要対応</div>':isCur?'<div class="sb-cur-dot"></div>':'');
@@ -1375,12 +1386,14 @@ async function startServer(
   occupiedPorts.add(port);
 
   // 過去のやり取りをイベントログに積む（途中参加のWeb UIに表示するため）
+  let lastPrompt: string | undefined;
   try {
     const history = ctx.sessionManager.buildSessionContext();
     for (const msg of history.messages) {
       const text = extractText(msg);
       if (!text) continue;
       if (msg.role === "user") {
+        lastPrompt = text.replace(/\s+/g, " ").slice(0, 120);
         pushEvent(sessionId, { type: "user:message", text });
       } else if (msg.role === "assistant") {
         pushEvent(sessionId, { type: "response:done", text });
@@ -1660,7 +1673,7 @@ async function startServer(
     const directUrl = `http://${getTailscaleIP()}:${port}`;
     let sessionFile: string | undefined;
     try { sessionFile = ctx.sessionManager.getSessionFile?.() ?? undefined; } catch {}
-    registerSession({ sessionId, port, url, directUrl, workingDir, pid: process.pid, paneId: process.env.HERDR_PANE_ID, sessionFile });
+    registerSession({ sessionId, port, url, directUrl, workingDir, pid: process.pid, paneId: process.env.HERDR_PANE_ID, sessionFile, lastPrompt });
     startHubWatcher(port);
     // 他の拡張（Python LSP 等）の session_start 通知が出終わった後に表示されるよう遅延
     setTimeout(() => {
@@ -1739,7 +1752,10 @@ export default function (pi: ExtensionAPI) {
     if (!isServerRunning) return;
     if (event.message?.role !== "user") return;
     const text = extractText(event.message);
-    if (text) pushEvent(sessionId, { type: "user:message", text });
+    if (text) {
+      pushEvent(sessionId, { type: "user:message", text });
+      patchRegistry(sessionId, { lastPrompt: text.replace(/\s+/g, " ").slice(0, 120) });
+    }
   });
 
   // ストリーミング中のアシスタントメッセージ更新（200ms 間引き）
